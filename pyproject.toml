@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neurose-vton-premium"
+version = "0.1.0"
+description = "NEUROSE VTON premium engine scaffold (deterministic, modular, model registry)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Mohamed Hussein ElGendy"}]
+dependencies = [
+  "pydantic>=2.4",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.24",
+]
+dev = [
+  "pytest>=7.4",
+  "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
