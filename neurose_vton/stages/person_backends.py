@@ -236,13 +236,13 @@ class DepthBackend:
 
     def compute(self, image_path: Path) -> Optional[Any]:
         log = logging.getLogger("neurose_vton.person.depth")
-        # Try MiDaS via torch.hub using local cache (storage/models/torch/hub)
+        # Try MiDaS via torch.hub using local cache (runtime_cache/torch/hub), seeded from storage if mounted
         try:
             import torch  # type: ignore
             import numpy as np  # type: ignore
             from PIL import Image
             try:
-                torch.hub.set_dir(str(Path("storage/models/torch/hub").resolve()))
+                torch.hub.set_dir(str(Path("/app/runtime_cache/torch/hub").resolve()))
             except Exception:
                 pass
             midas = torch.hub.load('intel-isl/MiDaS', 'DPT_Hybrid')

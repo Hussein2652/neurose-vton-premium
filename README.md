@@ -38,6 +38,7 @@ API: http://127.0.0.1:8000
 - `GET /v1/registry` (optionally `?alias=<name>`) — includes system info and model resolution report
 - `POST /v1/tryon-fast`
 - `POST /v1/tryon-premium`
+- `GET /ui` — simple in-browser UI to upload images and preview intermediates (served from `/files`)
 
 ## Determinism
 Set `seed` in requests (or use default from `NEUROSE_DEFAULT_SEED`). The server configures deterministic modes when available (Torch/CUDA), falling back gracefully on CPU‑only setups.
@@ -63,3 +64,41 @@ The registry never writes into these folders. Any per‑model cache must be plac
 ## Notes
 - This scaffold is model‑agnostic and network‑free. Integrate actual models in subsequent sprints (S2+).
 - Keep external mounts read‑only. Never modify their contents.
+## Docker (offline‑first, cache‑aware)
+
+Using Docker Compose (recommended):
+
+```
+docker compose build
+docker compose up
+```
+
+Live reload (Compose Watch, Docker Compose v2.22+):
+
+```
+docker compose watch
+```
+
+- Syncs local `neurose_vton/` and `scripts/` into the container.
+- Uvicorn runs with `--reload`, so code changes restart the server.
+- Rebuilds the image when `pyproject.toml` or `Dockerfile` changes.
+
+Dependencies
+- Installed at build time and cached in Docker layers. Rebuild only when `pyproject.toml` changes.
+- Models are never baked in; they are mounted read-only from `storage/`, `manual_downloads/`, and `third_party/`.
+
+What it does:
+- Mounts `storage/`, `manual_downloads/`, `third_party/` as read‑only.
+- Mounts `outputs/` and `runtime_cache/` as read‑write.
+- Mounts your host caches into `/host_cache/{pip,torch}` and a local wheelhouse into `/wheels`.
+- On startup, the entrypoint seeds caches from host and installs Python deps offline from `/wheels` (no network). Set `ALLOW_NET_INSTALL=1` to allow network installs.
+
+Optional: classic scripts are available (`scripts/docker_build.sh`, `scripts/docker_run.sh`), but Compose is preferred.
+- Torch Hub uses `/app/runtime_cache/torch/hub`; the entrypoint seeds from `storage/models/torch/hub` if present.
+
+Tip: Generate wheels once and reuse:
+
+```
+mkdir -p wheels
+pip wheel --wheel-dir wheels .[api]
+```

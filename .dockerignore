@@ -1,0 +1,24 @@
+# Reduce Docker build context
+storage/
+manual_downloads/
+third_party/
+outputs/
+runtime_cache/
+**/__pycache__/
+.git/
+.env
+.venv
+venv/
+*.py[cod]
+*.egg-info/
+tests/
+**/.pytest_cache/
+**/.mypy_cache/
+.idea/
+.vscode/
+*.ipynb
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.npz
+**/*.onnx

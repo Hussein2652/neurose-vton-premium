@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from starlette.staticfiles import StaticFiles
 
 from ..config import PATHS, SETTINGS
 from ..utils.determinism import set_seed, enable_determinism
@@ -22,6 +23,9 @@ app = FastAPI(title="NEUROSE VTON Premium (Scaffold)")
 def on_startup() -> None:
     configure_logging(SETTINGS.log_level)
     enable_determinism(strict=SETTINGS.strict_determinism)
+
+# Static mount for outputs to preview intermediates
+app.mount("/files", StaticFiles(directory=str(PATHS.outputs)), name="files")
 
 
 @app.get("/health")
@@ -42,6 +46,113 @@ def _persist_upload(tmp_dir: Path, f: UploadFile) -> Path:
     with target.open("wb") as out:
         out.write(f.file.read())
     return target
+
+
+def _trace_url(trace_dir: Path | None) -> str | None:
+    if not trace_dir:
+        return None
+    try:
+        rel = trace_dir.relative_to(PATHS.outputs)
+        return f"/files/{rel.as_posix()}"
+    except Exception:
+        return None
+
+
+@app.get("/ui")
+def ui() -> HTMLResponse:
+    html = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset=\"utf-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+    <title>NEUROSE VTON — Try-On UI</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+      .row { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 12px; flex-wrap: wrap; }
+      .col { display: flex; flex-direction: column; gap: 6px; }
+      .card { border: 1px solid #ddd; padding: 12px; border-radius: 8px; }
+      img { max-width: 280px; border: 1px solid #ccc; border-radius: 4px; }
+      code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; }
+      .muted { color: #666; font-size: 0.9em; }
+      button { padding: 8px 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>NEUROSE VTON — Simple Try-On</h1>
+    <div class=\"card\">
+      <form id=\"form\">
+        <div class=\"row\">
+          <div class=\"col\">
+            <label>Person image</label>
+            <input type=\"file\" name=\"person_image\" accept=\"image/*\" required />
+          </div>
+          <div class=\"col\">
+            <label>Garment image</label>
+            <input type=\"file\" name=\"garment_image\" accept=\"image/*\" required />
+          </div>
+        </div>
+        <div class=\"row\">
+          <div class=\"col\">
+            <label>Mode</label>
+            <select name=\"mode\">
+              <option value=\"fast\">fast (24 steps)</option>
+              <option value=\"premium\" selected>premium (40 steps)</option>
+            </select>
+          </div>
+          <div class=\"col\">
+            <label>Seed (optional)</label>
+            <input type=\"number\" name=\"seed\" placeholder=\"e.g. 12345\" />
+          </div>
+          <div class=\"col\">
+            <label><input type=\"checkbox\" name=\"return_intermediates\" checked /> save intermediates</label>
+          </div>
+        </div>
+        <button type=\"submit\">Run Try-On</button>
+      </form>
+    </div>
+
+    <div id=\"result\" class=\"card\" style=\"margin-top:16px; display:none;\"></div>
+
+    <script>
+      const form = document.getElementById('form');
+      const out = document.getElementById('result');
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        out.style.display = 'block';
+        out.innerHTML = '<div class=\"muted\">Running…</div>';
+        const fd = new FormData(form);
+        const mode = fd.get('mode');
+        const url = mode === 'fast' ? '/v1/tryon-fast' : '/v1/tryon-premium';
+        try {
+          const res = await fetch(url, { method: 'POST', body: fd });
+          const j = await res.json();
+          const traceUrl = j.trace_url || null;
+          let html = '';
+          html += '<div><b>Response</b>:</div>';
+          html += '<pre>'+JSON.stringify(j, null, 2)+'</pre>';
+          if (traceUrl) {
+            const p = traceUrl + '/person';
+            html += '<div class=\"row\">';
+            const imgs = [
+              'segmentation.png','hair_mask.png','arms_mask.png','hands_mask.png','depth.png','normals.png'
+            ];
+            for (const name of imgs) {
+              html += '<div class=\"col\"><div class=\"muted\">'+name+'</div><img src=\"'+p+'/'+name+'\" onerror=\"this.style.display=\\'none\\'\" /></div>';
+            }
+            html += '</div>';
+            html += '<div class=\"muted\">Trace folder: <code>'+traceUrl+'</code></div>';
+          }
+          out.innerHTML = html;
+        } catch (err) {
+          out.innerHTML = '<div style=\"color:#b00\">Error: '+(err?.message||err)+'</div>';
+        }
+      });
+    </script>
+  </body>
+  </html>
+    """
+    return HTMLResponse(html)
 
 
 @app.get("/v1/registry")
@@ -104,6 +215,7 @@ async def tryon_fast(
         "mode": "fast",
         "seed": seed or SETTINGS.seed,
         "trace_dir": str(result.trace_dir) if result.trace_dir else None,
+        "trace_url": _trace_url(result.trace_dir),
         "output_path": str(result.output_path) if result.output_path else None,
     })
 
@@ -125,5 +237,6 @@ async def tryon_premium(
         "mode": "premium",
         "seed": seed or SETTINGS.seed,
         "trace_dir": str(result.trace_dir) if result.trace_dir else None,
+        "trace_url": _trace_url(result.trace_dir),
         "output_path": str(result.output_path) if result.output_path else None,
     })

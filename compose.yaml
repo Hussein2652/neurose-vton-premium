@@ -1,0 +1,42 @@
+services:
+  api:
+    image: neurose-vton-premium:dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      NEUROSE_DEFAULT_SEED: "${NEUROSE_DEFAULT_SEED:-12345}"
+      NEUROSE_STRICT_DETERMINISM: "${NEUROSE_STRICT_DETERMINISM:-1}"
+      NEUROSE_LOG_LEVEL: "${NEUROSE_LOG_LEVEL:-INFO}"
+    volumes:
+      # Live code mount for hot reload (optional)
+      - ./neurose_vton:/app/neurose_vton
+      - ./scripts:/app/scripts
+      - ./storage:/app/storage:ro
+      - ./manual_downloads:/app/manual_downloads:ro
+      - ./third_party:/app/third_party:ro
+      - ./outputs:/app/outputs
+      - ./runtime_cache:/app/runtime_cache
+    # No host caches/wheels needed; deps installed at build time and cached in image layers
+    restart: unless-stopped
+    develop:
+      watch:
+        # Sync source code into the container (fast edit cycle)
+        - action: sync
+          path: ./neurose_vton
+          target: /app/neurose_vton
+          ignore:
+            - "**/__pycache__/**"
+            - "**/*.pyc"
+        - action: sync
+          path: ./scripts
+          target: /app/scripts
+          ignore:
+            - "**/*.log"
+        # Trigger rebuilds when build inputs change
+        - action: rebuild
+          path: ./pyproject.toml
+        - action: rebuild
+          path: ./Dockerfile

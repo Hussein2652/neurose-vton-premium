@@ -27,6 +27,11 @@ Interfaces
 - The orchestration entrypoint is `neurose_vton.pipeline.pipeline:TryOnPipeline`.
 - API app is `neurose_vton.api.main:app` and exposes `/v1/tryon-fast`, `/v1/tryon-premium`, and `/health`.
 
+Docker & Caching Policy
+- Do not bake models into images. Mount `storage/`, `manual_downloads/`, `third_party/` as read‑only volumes.
+- Dependencies are installed at build time and cached in layers; they won’t reinstall unless `pyproject.toml` changes.
+- Never write into external mounts; all runtime writes go to `/app/runtime_cache` and `/app/outputs`.
+
 Testing
 - Tests must not require GPU, network, or model downloads.
 - Prefer validating configs, path resolution, and deterministic seeding behavior.
