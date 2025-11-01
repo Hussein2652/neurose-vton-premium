@@ -18,6 +18,16 @@ dependencies = [
 api = [
   "fastapi>=0.110",
   "uvicorn[standard]>=0.24",
+  "python-multipart>=0.0.6",
+]
+person = [
+  "pillow>=10.0",
+  "tqdm>=4.66",
+  "opencv-python-headless>=4.8",
+  "ultralytics>=8.0.0",
+  "insightface>=0.7.3",
+  "onnxruntime-gpu>=1.16.0",
+  "smplx>=0.1.28",
 ]
 dev = [
   "pytest>=7.4",

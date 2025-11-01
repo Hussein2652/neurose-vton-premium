@@ -4,12 +4,17 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Default to CUDA 11.8 (RTX 30‑series friendly). Override via .env if needed.
+        PYTORCH_INDEX_URL: ${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu118}
     ports:
       - "8000:8000"
     environment:
       NEUROSE_DEFAULT_SEED: "${NEUROSE_DEFAULT_SEED:-12345}"
       NEUROSE_STRICT_DETERMINISM: "${NEUROSE_STRICT_DETERMINISM:-1}"
       NEUROSE_LOG_LEVEL: "${NEUROSE_LOG_LEVEL:-INFO}"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     volumes:
       # Live code mount for hot reload (optional)
       - ./neurose_vton:/app/neurose_vton
@@ -21,6 +26,8 @@ services:
       - ./runtime_cache:/app/runtime_cache
     # No host caches/wheels needed; deps installed at build time and cached in image layers
     restart: unless-stopped
+    # Request all GPUs via Docker Compose (requires NVIDIA Container Toolkit)
+    gpus: all
     develop:
       watch:
         # Sync source code into the container (fast edit cycle)
@@ -40,3 +47,10 @@ services:
           path: ./pyproject.toml
         - action: rebuild
           path: ./Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

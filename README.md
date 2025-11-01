@@ -87,6 +87,14 @@ Dependencies
 - Installed at build time and cached in Docker layers. Rebuild only when `pyproject.toml` changes.
 - Models are never baked in; they are mounted read-only from `storage/`, `manual_downloads/`, and `third_party/`.
 
+GPU (NVIDIA) setup
+- Install NVIDIA drivers and NVIDIA Container Toolkit on the host.
+- By default, the Compose build uses CUDA 11.8 wheels (cu118), which are a solid default for RTX 30‑series.
+- To change CUDA version, set a build arg before building:
+  - CUDA 12.1: `export PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu121`
+- Then rebuild: `docker compose build` and run: `docker compose up`.
+- The compose file requests GPUs and sets `NVIDIA_VISIBLE_DEVICES=all`.
+
 What it does:
 - Mounts `storage/`, `manual_downloads/`, `third_party/` as read‑only.
 - Mounts `outputs/` and `runtime_cache/` as read‑write.
