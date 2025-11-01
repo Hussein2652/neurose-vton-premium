@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from ..config import PATHS, SETTINGS
 from ..utils.determinism import set_seed, enable_determinism
+from ..utils.logging_utils import configure_logging
 from ..pipeline import TryOnConfig, TryOnPipeline
 from ..registry import registry
 from ..system import system_info
@@ -19,6 +20,7 @@ app = FastAPI(title="NEUROSE VTON Premium (Scaffold)")
 
 @app.on_event("startup")
 def on_startup() -> None:
+    configure_logging(SETTINGS.log_level)
     enable_determinism(strict=SETTINGS.strict_determinism)
 
 

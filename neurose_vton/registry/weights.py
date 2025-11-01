@@ -87,16 +87,25 @@ class ModelRegistry:
 SPECS: list[ModelSpec] = [
     # 1) Person analysis
     ModelSpec("insightface", "Face detection/embeddings (InsightFace / InstantID)", [
+        "**/unpacked/antelopev2",
+        "**/antelopev2*",
+        "**/antelopev2*/*",
         "**/insightface*/*",
         "**/instantid*/*",
     ]),
-    ModelSpec("openpose", "OpenPose BODY_25 or equivalent pose weights", [
+    ModelSpec("openpose", "OpenPose BODY_25 or YOLOv8-pose weights", [
         "**/openpose*/*",
         "**/body_25*/*",
+        "**/yolov8*pose*",
         "**/yolov8*pose*/*",
     ]),
     ModelSpec("schp", "SCHP human parsing", ["**/schp*/*", "**/human*parsing*/*"]),
-    ModelSpec("depth", "Zoe-Depth / DPT-Hybrid", ["**/zoe*depth*/*", "**/dpt*hybrid*/*"]),
+    ModelSpec("depth", "Zoe-Depth / DPT-Hybrid", [
+        "**/zoe*depth*/*",
+        "**/ZoeD*",
+        "**/dpt*hybrid*/*",
+        "**/*midas*/*",
+    ]),
     ModelSpec("smplx", "SMPL-X body model", ["**/smplx*/*", "**/smpl*/*"]),
     ModelSpec("relight_sh", "Spherical harmonics relight head", ["**/sh*relight*/*"]),
 

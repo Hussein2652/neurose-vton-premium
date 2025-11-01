@@ -7,6 +7,7 @@ import subprocess
 import shutil
 import sys
 import os
+import logging
 
 
 def _load_image(path: Path):
@@ -38,20 +39,32 @@ class FaceIDBackend:
             self._lib = None
 
     def compute(self, image_path: Path) -> Optional[FaceResult]:
+        log = logging.getLogger("neurose_vton.person.face")
         if self._lib is None:
+            log.warning("InsightFace not installed; skipping face analysis")
             return None
         try:
             import numpy as np  # type: ignore
             from insightface.app import FaceAnalysis  # type: ignore
-
-            app = FaceAnalysis(name="buffalo_l", root=str(self.model_dir) if self.model_dir else None)
+            # Choose model pack name by available files
+            pack = "buffalo_l"
+            root_path = self.model_dir
+            if self.model_dir:
+                if (self.model_dir / "antelopev2").exists():
+                    pack = "antelopev2"
+                elif (self.model_dir / "unpacked" / "antelopev2").exists():
+                    pack = "antelopev2"
+                    root_path = self.model_dir / "unpacked"
+            app = FaceAnalysis(name=pack, root=str(root_path) if root_path else None)
             app.prepare(ctx_id=0 if self._has_cuda() else -1)
             img = _load_image(image_path)
             if img is None:
+                log.error("Failed to load image for face analysis: %s", image_path)
                 return None
             arr = np.array(img)[:, :, ::-1]  # BGR for insightface
             faces = app.get(arr)
             if not faces:
+                log.info("No face detected")
                 return FaceResult(bbox=None, embedding=None, landmarks=None)
             f = faces[0]
             bbox = [float(x) for x in f.bbox]
@@ -62,8 +75,10 @@ class FaceIDBackend:
                 lms = [[float(x), float(y)] for x, y in f.landmark_2d_106.tolist()]
             elif hasattr(f, "kps") and f.kps is not None:
                 lms = [[float(x), float(y)] for x, y in f.kps.tolist()]
+            log.info("Face detected; bbox=%s emb=%s lms=%s", bbox is not None, emb is not None, lms is not None)
             return FaceResult(bbox=bbox, embedding=emb, landmarks=lms)
-        except Exception:
+        except Exception as e:
+            log.exception("Face analysis failed: %s", e)
             return None
 
     @staticmethod
@@ -80,10 +95,21 @@ class PoseBackend:
         self.model_dir = model_dir
 
     def compute(self, image_path: Path) -> Optional[Dict[str, Any]]:
+        log = logging.getLogger("neurose_vton.person.pose")
         # Try ultralytics YOLOv8-pose first
         try:
             from ultralytics import YOLO  # type: ignore
-            model = YOLO("yolov8n-pose.pt")  # relies on local weights cache if present
+            # Prefer explicit local .pt if provided/resolved
+            weight = None
+            if self.model_dir is not None:
+                # self.model_dir may be a file or directory; handle both
+                if self.model_dir.is_file():
+                    weight = str(self.model_dir)
+                else:
+                    for cand in self.model_dir.rglob("yolov8*pose*.pt"):
+                        weight = str(cand)
+                        break
+            model = YOLO(weight or "yolov8n-pose.pt")
             results = model(source=str(image_path), imgsz=640, device=0 if self._has_cuda() else "cpu")
             # Convert first result to BODY_25-like list
             kps = []
@@ -92,8 +118,10 @@ class PoseBackend:
                     k = r.keypoints.xy[0].tolist()
                     kps = [[float(x), float(y)] for x, y in k]
                     break
+            log.info("Pose estimated with YOLOv8; points=%d", len(kps))
             return {"format": "YOLOv8", "keypoints": kps}
-        except Exception:
+        except Exception as e:
+            log.warning("YOLOv8 pose failed (%s); falling back", e)
             pass
         # Fallback: unavailable
         return None
@@ -112,31 +140,43 @@ class ParsingBackend:
         self.model_dir = model_dir
 
     def compute(self, image_path: Path) -> Optional[Path]:
+        log = logging.getLogger("neurose_vton.person.parsing")
         try:
             # Locate SCHP repo and weights
-            if not self.model_dir:
-                return None
-            # Search for repo folder
-            candidates = [
-                self.model_dir / "Self-Correction-Human-Parsing-master",
-                self.model_dir,
-            ]
             repo = None
-            for c in candidates:
+            weight = None
+            # Candidates for repo
+            repo_candidates: List[Path] = []
+            if self.model_dir:
+                repo_candidates += [self.model_dir / "Self-Correction-Human-Parsing-master", self.model_dir]
+            # Common locations in this repo
+            repo_candidates += [
+                Path("third_party/schp/Self-Correction-Human-Parsing-master").resolve(),
+                Path("manual_downloads/schp_downloads/Self-Correction-Human-Parsing-master").resolve(),
+            ]
+            for c in repo_candidates:
                 if (c / "simple_extractor.py").exists():
                     repo = c
                     break
             if repo is None:
+                log.warning("SCHP repo not found; skipping parsing")
                 return None
-            weight = None
-            for p in [
-                self.model_dir / "exp-schp-201908261155-lip.pth",
-                self.model_dir.parent / "manual_downloads" / "schp_downloads" / "exp-schp-201908261155-lip.pth",
-            ]:
+            # Search for repo folder
+            weight_candidates: List[Path] = []
+            # storage models
+            weight_candidates += list(Path("storage/models/schp_lip").rglob("exp-schp-201908261155-lip.pth"))
+            # manual downloads
+            weight_candidates += [
+                Path("manual_downloads/schp_downloads/exp-schp-201908261155-lip.pth").resolve(),
+            ]
+            if self.model_dir:
+                weight_candidates += [self.model_dir / "exp-schp-201908261155-lip.pth"]
+            for p in weight_candidates:
                 if p.exists():
                     weight = p
                     break
             if weight is None:
+                log.warning("SCHP weight not found; skipping parsing")
                 return None
 
             # Prepare temp IO dirs
@@ -173,14 +213,20 @@ class ParsingBackend:
             env = os.environ.copy()
             # Prepend repo to PYTHONPATH so its local imports resolve
             env["PYTHONPATH"] = f"{repo}:{env.get('PYTHONPATH','')}"
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+            if proc.returncode != 0:
+                log.error("SCHP extractor failed: %s", proc.stderr[-500:])
+                return None
+            else:
+                log.info("SCHP extractor ok: %s", proc.stdout.splitlines()[-1] if proc.stdout else "done")
 
             # Output PNG has same stem
             out_img = out_dir / (image_path.stem + ".png")
             if out_img.exists():
                 return out_img
             return None
-        except Exception:
+        except Exception as e:
+            log.exception("SCHP parsing exception: %s", e)
             return None
 
 
@@ -189,11 +235,16 @@ class DepthBackend:
         self.model_dir = model_dir
 
     def compute(self, image_path: Path) -> Optional[Any]:
-        # Try MiDaS via torch.hub if cached locally
+        log = logging.getLogger("neurose_vton.person.depth")
+        # Try MiDaS via torch.hub using local cache (storage/models/torch/hub)
         try:
             import torch  # type: ignore
             import numpy as np  # type: ignore
             from PIL import Image
+            try:
+                torch.hub.set_dir(str(Path("storage/models/torch/hub").resolve()))
+            except Exception:
+                pass
             midas = torch.hub.load('intel-isl/MiDaS', 'DPT_Hybrid')
             midas.eval()
             transforms = torch.hub.load('intel-isl/MiDaS', 'transforms')
@@ -216,8 +267,10 @@ class DepthBackend:
             n = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-8
             normals = (normals / n + 1.0) * 0.5
             normals_u8 = (normals * 255).astype(np.uint8)
+            log.info("Depth estimated via MiDaS cached hub")
             return {"depth": depth_u8, "normals": normals_u8}
-        except Exception:
+        except Exception as e:
+            log.warning("Depth backend failed (%s); using placeholder", e)
             return None
 
 
@@ -226,21 +279,28 @@ class SmplxBackend:
         self.model_dir = model_dir
 
     def compute(self, image_path: Path) -> Optional[Path]:
+        log = logging.getLogger("neurose_vton.person.smplx")
         # Try simple neutral mesh export using smplx if available
         try:
             import torch  # type: ignore
             import smplx  # type: ignore
-            model_path = None
-            if self.model_dir and self.model_dir.exists():
-                # Look for SMPLX_NEUTRAL_2020.npz or SMPLX_NEUTRAL.npz
-                for name in ["SMPLX_NEUTRAL.npz", "SMPLX_NEUTRAL_2020.npz"]:
-                    cand = self.model_dir / name
-                    if cand.exists():
-                        model_path = self.model_dir
+            model_dir = None
+            # Prefer explicit model_dir if contains .npz
+            candidates: List[Path] = []
+            if self.model_dir:
+                candidates.append(self.model_dir)
+            candidates += [Path("manual_downloads/smplx_downloads").resolve()]
+            for d in candidates:
+                for name in ["SMPLX_NEUTRAL_2020.npz", "SMPLX_NEUTRAL.npz"]:
+                    if (d / name).exists():
+                        model_dir = d
                         break
-            if model_path is None:
+                if model_dir:
+                    break
+            if model_dir is None:
+                log.warning("SMPL-X neutral npz not found; skipping")
                 return None
-            model = smplx.create(model_path=str(model_path), model_type='smplx', gender='neutral', use_pca=False)
+            model = smplx.create(model_path=str(model_dir), model_type='smplx', gender='neutral', use_pca=False)
             out = model()
             verts = out.vertices[0].detach().cpu().numpy()
             faces = model.faces
@@ -252,8 +312,10 @@ class SmplxBackend:
                     f.write(f"v {v[0]} {v[1]} {v[2]}\n")
                 for face in faces:
                     f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+            log.info("SMPL-X mesh generated")
             return obj
-        except Exception:
+        except Exception as e:
+            log.warning("SMPL-X backend failed (%s); using placeholder", e)
             return None
 
 

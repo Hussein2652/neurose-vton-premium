@@ -8,6 +8,7 @@ from typing import Optional
 
 from ..config import PATHS, SETTINGS
 from ..utils.determinism import set_seed, enable_determinism
+from ..utils.logging_utils import configure_logging
 from ..stages import (
     CompositionPlanning,
     DiffusionCore,
@@ -35,6 +36,7 @@ class TryOnResult:
 class TryOnPipeline:
     def __init__(self, cfg: TryOnConfig):
         self.cfg = cfg
+        configure_logging(SETTINGS.log_level)
         enable_determinism(strict=SETTINGS.strict_determinism)
 
     def _trace_dir(self) -> Path:

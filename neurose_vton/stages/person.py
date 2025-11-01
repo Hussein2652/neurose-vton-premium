@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Dict, Any
 import json
+import logging
 
 from .base import StageOutput
 from ..registry import registry
@@ -74,6 +75,8 @@ f 1 2 3
             self._save_blank_png(hands, 64, 64, 1)
 
     def run(self, image_path: Path, seed: int, trace_dir: Optional[Path] = None) -> StageOutput:
+        log = logging.getLogger("neurose_vton.person")
+        log.info("PersonAnalysis start | image=%s seed=%s trace=%s", image_path, seed, bool(trace_dir))
         # Resolve model availability via registry (no heavy loads here)
         resolved = {
             "insightface": str(registry.resolve("insightface") or ""),
@@ -97,10 +100,12 @@ f 1 2 3
                 self._save_json(face_det_json, {"bbox": None})
                 self._save_json(face_lms_json, {"landmarks": []})
                 self._save_json(face_emb_json, {"embedding": None})
+                log.warning("Face step: fallback")
             else:
                 self._save_json(face_det_json, {"bbox": face_res.bbox})
                 self._save_json(face_lms_json, {"landmarks": face_res.landmarks or []})
                 self._save_json(face_emb_json, {"embedding": face_res.embedding})
+                log.info("Face step: ok | det,lms,emb saved")
             artifacts["face_detection"] = face_det_json
             artifacts["face_landmarks"] = face_lms_json
             artifacts["face_embedding"] = face_emb_json
@@ -110,8 +115,13 @@ f 1 2 3
             pose_res = pose_backend.compute(image_path)
             if pose_res is None:
                 self._save_json(pose_json, {"keypoints": [], "format": "BODY_25", "note": "placeholder"})
+                log.warning("Pose step: fallback")
             else:
                 self._save_json(pose_json, pose_res)
+                try:
+                    log.info("Pose step: ok | %d keypoints", len(pose_res.get("keypoints", [])))
+                except Exception:
+                    log.info("Pose step: ok")
             artifacts["pose"] = pose_json
 
             # Segmentation via SCHP if available
@@ -122,13 +132,17 @@ f 1 2 3
                 try:
                     import shutil
                     shutil.copyfile(seg_path, seg_png)
+                    log.info("Parsing step: ok | segmentation saved")
                 except Exception:
                     self._save_blank_png(seg_png, 64, 64, 1)
+                    log.warning("Parsing step: copy failed; fallback")
             else:
                 self._save_blank_png(seg_png, 64, 64, 1)
+                log.warning("Parsing step: fallback (no output)")
             artifacts["segmentation"] = seg_png
             # Derive occluder masks from segmentation if possible
             self._save_occluder_masks(seg_png, out_dir)
+            log.info("Parsing step: occluder masks saved")
 
             # Depth + normals via depth backend if available
             depth_png = out_dir / "depth.png"
@@ -141,12 +155,15 @@ f 1 2 3
                     import numpy as np
                     Image.fromarray(depth_res["depth"]).save(depth_png)
                     Image.fromarray(depth_res["normals"]).save(normals_png)
+                    log.info("Depth step: ok | depth+normals saved")
                 except Exception:
                     self._save_blank_png(depth_png, 64, 64, 1)
                     self._save_blank_png(normals_png, 64, 64, 3)
+                    log.warning("Depth step: write failed; fallback")
             else:
                 self._save_blank_png(depth_png, 64, 64, 1)
                 self._save_blank_png(normals_png, 64, 64, 3)
+                log.warning("Depth step: fallback (no output)")
             artifacts["depth"] = depth_png
             artifacts["normals"] = normals_png
 
@@ -158,10 +175,13 @@ f 1 2 3
                 try:
                     import shutil
                     shutil.copyfile(smplx_obj, mesh_obj)
+                    log.info("SMPL-X step: ok | mesh saved")
                 except Exception:
                     self._save_placeholder_mesh(mesh_obj)
+                    log.warning("SMPL-X step: copy failed; fallback")
             else:
                 self._save_placeholder_mesh(mesh_obj)
+                log.warning("SMPL-X step: fallback (no mesh)")
             artifacts["body_mesh"] = mesh_obj
 
             # Lighting SH attempt
@@ -169,11 +189,23 @@ f 1 2 3
             light_backend = LightingBackend()
             light_res = light_backend.compute(image_path) or {"sh9": [0.0] * 9}
             self._save_json(light_json, light_res)
+            log.info("Lighting step: ok | SH saved")
             artifacts["light_sh"] = light_json
 
             # Models resolution snapshot
             models_json = out_dir / "models.json"
+            status_json = out_dir / "status.json"
             self._save_json(models_json, resolved)
+            status = {
+                "face": bool(face_res),
+                "pose": bool(pose_res),
+                "parsing": bool(seg_path and seg_path.exists()),
+                "depth": bool(depth_res),
+                "smplx": bool(smplx_obj and smplx_obj.exists()),
+                "lighting": True,
+            }
+            self._save_json(status_json, status)
+            log.info("PersonAnalysis complete | status=%s", status)
             artifacts["models"] = models_json
 
         return StageOutput(
