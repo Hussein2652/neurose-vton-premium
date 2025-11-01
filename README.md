@@ -86,6 +86,7 @@ docker compose watch
 Dependencies
 - Installed at build time and cached in Docker layers. Rebuild only when `pyproject.toml` changes.
 - Models are never baked in; they are mounted read-only from `storage/`, `manual_downloads/`, and `third_party/`.
+- BuildKit caching: The Dockerfile uses BuildKit cache mounts for apt and pip, so repeated builds reuse cached metadata and wheels. Ensure BuildKit is enabled (Compose v2 enables it by default). You can export `DOCKER_BUILDKIT=1` explicitly if needed.
 
 GPU (NVIDIA) setup
 - Install NVIDIA drivers and NVIDIA Container Toolkit on the host.
