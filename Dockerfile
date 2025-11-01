@@ -26,9 +26,11 @@ RUN --mount=type=cache,target=/var/cache/apt \
       pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Create runtime dirs and install dependencies at build time (deps cached in layers)
-RUN mkdir -p /app/runtime_cache /app/outputs && \
-    --mount=type=cache,target=/root/.cache/pip \
+# Create runtime dirs (separate from pip cache mount)
+RUN mkdir -p /app/runtime_cache /app/outputs
+
+# Upgrade pip using persistent pip cache
+RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip
 
 # Allow selecting PyTorch channel (CPU by default). Override at build with:
