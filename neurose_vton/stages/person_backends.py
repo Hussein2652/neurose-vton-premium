@@ -44,13 +44,11 @@ class FaceIDBackend:
         If storage models are available under a read-only mount, copy them into
         a writable cache: PATHS.runtime_cache/insightface/models/<pack>.
         """
-        # Decide pack name based on provided model_dir path
-        pack = "buffalo_l"
+        # Prefer antelopev2 for stable embeddings; allow explicit override
+        pack = "antelopev2"
         if self.model_dir:
             pstr = str(self.model_dir).lower()
-            if "antelopev2" in pstr:
-                pack = "antelopev2"
-            elif "buffalo" in pstr:
+            if "buffalo" in pstr and "antelopev2" not in pstr:
                 pack = "buffalo_l"
         writable_root = PATHS.runtime_cache / "insightface"
         try:
@@ -79,8 +77,15 @@ class FaceIDBackend:
             from insightface.app import FaceAnalysis  # type: ignore
             # Prepare models under writable cache root to avoid read-only mounts
             pack, writable_root = self._prepare_models()
-            app = FaceAnalysis(name=pack, root=str(writable_root))
-            app.prepare(ctx_id=0 if self._has_cuda() else -1)
+            try:
+                app = FaceAnalysis(name=pack, root=str(writable_root), providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            except Exception:
+                app = FaceAnalysis(name=pack, root=str(writable_root))
+            # Stable det size and CUDA ctx if available
+            try:
+                app.prepare(ctx_id=0 if self._has_cuda() else -1, det_size=(640, 640))
+            except Exception:
+                app.prepare(ctx_id=0 if self._has_cuda() else -1)
             img = _load_image(image_path)
             if img is None:
                 log.error("Failed to load image for face analysis: %s", image_path)
@@ -133,7 +138,11 @@ class PoseBackend:
                     for cand in self.model_dir.rglob("yolov8*pose*.pt"):
                         weight = str(cand)
                         break
-            model = YOLO(weight or "yolov8n-pose.pt")
+            # Strictly offline: require a local weight
+            if weight is None:
+                log.error("YOLOv8 pose weight not found locally; set model_dir to your yolov8-pose .pt")
+                return None
+            model = YOLO(weight)
             results = model(source=str(image_path), imgsz=640, device=0 if self._has_cuda() else "cpu")
             # Convert first result to COCO17 list
             coco17: List[List[float]] = []
@@ -385,118 +394,61 @@ class DepthBackend:
         import torch  # type: ignore
         import numpy as np  # type: ignore
         from PIL import Image
-        # Resolve checkpoint: prefer provided model_dir; else known storage path
+        # 1) Resolve checkpoint
         ckpt: Optional[Path] = None
-        candidates: List[Path] = []
         if self.model_dir:
             if self.model_dir.is_file():
-                candidates.append(self.model_dir)
+                ckpt = self.model_dir
             else:
-                candidates += list(self.model_dir.rglob("ZoeD_*NK*.pt"))
-                candidates += list(self.model_dir.rglob("ZoeD_*.pt"))
-        candidates.append(Path("storage/models/zoedepth_m12_nk/v1/ZoeD_M12_NK.pt").resolve())
-        for c in candidates:
-            if c.exists():
-                ckpt = c
-                break
-        if not ckpt or not ckpt.exists():
-            return None
-        # Import zoedepth either via local hubconf (preferred) or from package
-        env_repo = os.environ.get("NEUROSE_ZOEDEPTH_REPO")
-        repo_candidates: List[Path] = []
-        if env_repo:
-            repo_candidates.append(Path(env_repo).resolve())
-        repo_candidates.append(Path("third_party/zoedepth").resolve())
-        cache_repo = (PATHS.runtime_cache / "zoedepth_repo").resolve()
-        repo_candidates.append(cache_repo)
-
-        def _ensure_cache_extract() -> None:
-            if cache_repo.exists():
-                return
-            zips: List[Path] = []
-            try:
-                manual_zroot = (PATHS.manual / "zoedepth_downloads").resolve()
-                if manual_zroot.exists():
-                    for z in manual_zroot.glob("ZoeDepth*.zip"):
-                        zips.append(z)
-            except Exception:
-                pass
-            if zips:
-                import zipfile
-                cache_repo.mkdir(parents=True, exist_ok=True)
-                try:
-                    with zipfile.ZipFile(str(zips[0]), 'r') as zf:
-                        zf.extractall(str(cache_repo))
-                except Exception:
-                    pass
-
-        # Try local hubconf first for the chosen repo
-        variant = "zoedepth_nk" if "NK" in ckpt.name.upper() else "zoedepth"
-        hub_loaded = False
-        for repo_dir in repo_candidates:
-            if not repo_dir.exists():
-                if repo_dir == cache_repo:
-                    _ensure_cache_extract()
-                if not repo_dir.exists():
-                    continue
-            hubconf = repo_dir / "hubconf.py"
-            if hubconf.exists():
-                try:
-                    entries = (
-                        ['ZoeD_M12_NK', 'ZoeD_NK'] if variant == 'zoedepth_nk' else ['ZoeD_M12_N', 'ZoeD_N']
-                    )
-                    last_err: Optional[Exception] = None
-                    for entry in entries:
-                        try:
-                            model = torch.hub.load(str(repo_dir), entry, source='local', pretrained=False)
-                            hub_loaded = True
-                            break
-                        except Exception as e:
-                            last_err = e
-                            continue
-                    if not hub_loaded and last_err is not None:
-                        raise last_err
-                    hub_loaded = True
-                    break
-                except Exception:
-                    pass
-
-        if not hub_loaded:
-            # Fallback to importing builder from package paths
-            for repo_dir in repo_candidates:
-                if repo_dir.exists():
-                    sys.path.insert(0, str(repo_dir))
-                    # also add first-level subdir (e.g., ZoeDepth-main)
+                for pat in ("**/ZoeD_*NK*.pt", "**/ZoeD_*.pt"):
                     try:
-                        subs = list(repo_dir.iterdir())
-                        for s in subs:
-                            if s.is_dir():
-                                sys.path.insert(0, str(s))
-                                break
-                    except Exception:
+                        found = next(self.model_dir.glob(pat))
+                        ckpt = found
+                        break
+                    except StopIteration:
                         pass
-            from zoedepth.models.builder import build_model  # type: ignore
-            from zoedepth.utils.config import get_config  # type: ignore
-            conf = get_config(variant, "infer")
-            # prevent pretrained URL usage
-            for key in ("pretrained_resource", "pretrained_model", "pretrained_resource_model"):
+        if ckpt is None:
+            cand = Path("storage/models/zoedepth_m12_nk/v1/ZoeD_M12_NK.pt").resolve()
+            if cand.exists():
+                ckpt = cand
+        if ckpt is None or not ckpt.exists():
+            return None
+
+        # 2) Import zoedepth package first; if missing, try local repo via NEUROSE_ZOEDEPTH_REPO and third_party
+        build_model = None
+        zget_config = None
+        try:
+            from zoedepth.models.builder import build_model as _bm  # type: ignore
+            from zoedepth.utils.config import get_config as _gc  # type: ignore
+            build_model, zget_config = _bm, _gc
+        except Exception:
+            repo_paths: List[Path] = []
+            env_repo = os.environ.get("NEUROSE_ZOEDEPTH_REPO")
+            if env_repo:
+                repo_paths.append(Path(env_repo).resolve())
+            repo_paths.append(Path("third_party/zoedepth").resolve())
+            cache_repo = (PATHS.runtime_cache / "zoedepth_repo").resolve()
+            repo_paths.append(cache_repo)
+            for repo in repo_paths:
+                if not repo.exists():
+                    continue
+                sys.path.insert(0, str(repo))
                 try:
-                    setattr(conf, key, None)
+                    subs = list(repo.iterdir())
+                    for s in subs:
+                        if s.is_dir():
+                            sys.path.insert(0, str(s))
+                            break
                 except Exception:
                     pass
-            try:
-                if hasattr(conf, "zoedepth") and isinstance(conf.zoedepth, dict):
-                    conf.zoedepth["pretrained_resource"] = None
-                if hasattr(conf, "zoedepth_nk") and isinstance(conf.zoedepth_nk, dict):
-                    conf.zoedepth_nk["pretrained_resource"] = None
-            except Exception:
-                pass
-            model = build_model(conf)
+            from zoedepth.models.builder import build_model as _bm  # type: ignore
+            from zoedepth.utils.config import get_config as _gc  # type: ignore
+            build_model, zget_config = _bm, _gc
 
-        # Pick NK variant if checkpoint name suggests it; prevents wrong weights mapping
+        # 3) Build config and model without any pretrained URL
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         variant = "zoedepth_nk" if "NK" in ckpt.name.upper() else "zoedepth"
-        conf = get_config(variant, "infer")
-        # Best-effort to prevent any pretrained URL download from config
+        conf = zget_config(variant, "infer")
         for key in ("pretrained_resource", "pretrained_model", "pretrained_resource_model"):
             try:
                 setattr(conf, key, None)
@@ -509,7 +461,53 @@ class DepthBackend:
                 conf.zoedepth_nk["pretrained_resource"] = None
         except Exception:
             pass
-        model = build_model(conf)
+        model = build_model(conf).to(device).eval()
+        # 4) Load checkpoint
+        sd = torch.load(str(ckpt), map_location=device)
+        state = sd.get("state_dict", sd.get("model", sd))
+        try:
+            model.load_state_dict(state, strict=False)
+        except Exception:
+            # Patch missing drop_path in some repos
+            try:
+                import torch.nn as nn  # type: ignore
+                for mod in getattr(model, 'modules', lambda: [])():
+                    if not hasattr(mod, 'drop_path'):
+                        try:
+                            setattr(mod, 'drop_path', nn.Identity())
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            model.load_state_dict(state, strict=False)
+
+        # 5) Inference
+        img = Image.open(image_path).convert('RGB')
+        arr = np.asarray(img).astype('float32') / 255.0
+        H, W = arr.shape[:2]
+        x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
+        with torch.inference_mode():
+            out = model(x)
+            if isinstance(out, (list, tuple)):
+                depth = out[0]
+            elif isinstance(out, dict):
+                depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+            else:
+                depth = out
+            depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
+            depth = depth.squeeze().detach().cpu().float().numpy()
+        # 6) Normalize and normals
+        p = depth
+        pmin, pmax = float(p.min()), float(p.max())
+        p = (p - pmin) / (pmax - pmin + 1e-8)
+        depth_u8 = (p * 255.0).astype(np.uint8)
+        gy, gx = np.gradient(p)
+        nz = np.ones_like(p)
+        normals = np.stack([gx, gy, nz], axis=-1)
+        n = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-8
+        normals = (normals / n + 1.0) * 0.5
+        normals_u8 = (normals * 255.0).astype(np.uint8)
+        return {"depth": depth_u8, "normals": normals_u8, "_backend": ("zoedepth_m12_nk" if "NK" in ckpt.name.upper() else "zoedepth")}
         # Patch missing drop_path in some repos
         try:
             import torch.nn as nn  # type: ignore
