@@ -4,30 +4,24 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    pull_policy: never
     ports:
       - "8000:8000"
+    gpus: all
     environment:
       NEUROSE_DEFAULT_SEED: "${NEUROSE_DEFAULT_SEED:-12345}"
       NEUROSE_STRICT_DETERMINISM: "${NEUROSE_STRICT_DETERMINISM:-1}"
       NEUROSE_LOG_LEVEL: "${NEUROSE_LOG_LEVEL:-INFO}"
-      NVIDIA_VISIBLE_DEVICES: "all"
-      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
     volumes:
-      # Live code mount for hot reload (optional)
-      - ./neurose_vton:/app/neurose_vton
-      - ./scripts:/app/scripts
       - ./storage:/app/storage:ro
       - ./manual_downloads:/app/manual_downloads:ro
       - ./third_party:/app/third_party:ro
       - ./outputs:/app/outputs
       - ./runtime_cache:/app/runtime_cache
-    # No host caches/wheels needed; deps installed at build time and cached in image layers
-    restart: unless-stopped
-    # Request all GPUs via Docker Compose (requires NVIDIA Container Toolkit)
-    gpus: all
+      - ./neurose_vton:/app/neurose_vton
+      - ./scripts:/app/scripts
     develop:
       watch:
-        # Sync source code into the container (fast edit cycle)
         - action: sync
           path: ./neurose_vton
           target: /app/neurose_vton
@@ -37,17 +31,7 @@ services:
         - action: sync
           path: ./scripts
           target: /app/scripts
-          ignore:
-            - "**/*.log"
-        # Trigger rebuilds when build inputs change
         - action: rebuild
-          path: ./pyproject.toml
+          path: ./requirements.lock
         - action: rebuild
           path: ./Dockerfile
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]

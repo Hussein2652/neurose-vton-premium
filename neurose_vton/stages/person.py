@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, Dict, Any
+import time
 import json
 import logging
 
@@ -88,6 +89,13 @@ f 1 2 3
         }
 
         artifacts: Dict[str, Path] = {}
+        status_map: Dict[str, Any] = {}
+        def _dev() -> str:
+            try:
+                import torch  # type: ignore
+                return "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                return "cpu"
         if trace_dir is not None:
             out_dir = trace_dir / "person"
             # Face detection + landmarks + embedding
@@ -95,7 +103,9 @@ f 1 2 3
             face_lms_json = out_dir / "face_landmarks.json"
             face_emb_json = out_dir / "face_embedding.json"
             face_backend = FaceIDBackend(model_dir=Path(resolved["insightface"]) if resolved["insightface"] else None)
+            t0 = time.time()
             face_res = face_backend.compute(image_path)
+            t_face = int((time.time() - t0) * 1000)
             if face_res is None:
                 self._save_json(face_det_json, {"bbox": None})
                 self._save_json(face_lms_json, {"landmarks": []})
@@ -109,10 +119,13 @@ f 1 2 3
             artifacts["face_detection"] = face_det_json
             artifacts["face_landmarks"] = face_lms_json
             artifacts["face_embedding"] = face_emb_json
+            status_map["face"] = {"ok": bool(face_res), "backend": "insightface", "device": "cpu", "ms": t_face}
             # Try compute pose
             pose_json = out_dir / "pose.json"
             pose_backend = PoseBackend(model_dir=Path(resolved["openpose"]) if resolved["openpose"] else None)
+            t0 = time.time()
             pose_res = pose_backend.compute(image_path)
+            t_pose = int((time.time() - t0) * 1000)
             if pose_res is None:
                 self._save_json(pose_json, {"keypoints": [], "format": "BODY_25", "note": "placeholder"})
                 log.warning("Pose step: fallback")
@@ -123,11 +136,14 @@ f 1 2 3
                 except Exception:
                     log.info("Pose step: ok")
             artifacts["pose"] = pose_json
+            status_map["pose"] = {"ok": bool(pose_res), "backend": "yolov8", "device": _dev(), "ms": t_pose}
 
             # Segmentation via SCHP if available
             seg_png = out_dir / "segmentation.png"
             parsing_backend = ParsingBackend(model_dir=Path(resolved["schp"]) if resolved["schp"] else None)
+            t0 = time.time()
             seg_path = parsing_backend.compute(image_path)
+            t_pars = int((time.time() - t0) * 1000)
             if seg_path and seg_path.exists():
                 try:
                     import shutil
@@ -143,12 +159,15 @@ f 1 2 3
             # Derive occluder masks from segmentation if possible
             self._save_occluder_masks(seg_png, out_dir)
             log.info("Parsing step: occluder masks saved")
+            status_map["parsing"] = {"ok": bool(seg_path and seg_path.exists()), "backend": "schp", "device": _dev(), "ms": t_pars}
 
             # Depth + normals via depth backend if available
             depth_png = out_dir / "depth.png"
             normals_png = out_dir / "normals.png"
             depth_backend = DepthBackend(model_dir=None)
+            t0 = time.time()
             depth_res = depth_backend.compute(image_path)
+            t_depth = int((time.time() - t0) * 1000)
             if depth_res is not None:
                 try:
                     from PIL import Image
@@ -166,11 +185,20 @@ f 1 2 3
                 log.warning("Depth step: fallback (no output)")
             artifacts["depth"] = depth_png
             artifacts["normals"] = normals_png
+            bd = "midas"
+            try:
+                if isinstance(depth_res, dict) and depth_res.get("_backend"):
+                    bd = str(depth_res.get("_backend"))
+            except Exception:
+                pass
+            status_map["depth"] = {"ok": bool(depth_res), "backend": bd, "device": _dev(), "ms": t_depth}
 
             # SMPL-X mesh if available
             mesh_obj = out_dir / "body_mesh.obj"
             smplx_backend = SmplxBackend(model_dir=Path(resolved["smplx"]) if resolved["smplx"] else None)
+            t0 = time.time()
             smplx_obj = smplx_backend.compute(image_path)
+            t_smplx = int((time.time() - t0) * 1000)
             if smplx_obj and smplx_obj.exists():
                 try:
                     import shutil
@@ -183,29 +211,25 @@ f 1 2 3
                 self._save_placeholder_mesh(mesh_obj)
                 log.warning("SMPL-X step: fallback (no mesh)")
             artifacts["body_mesh"] = mesh_obj
+            status_map["smplx"] = {"ok": bool(smplx_obj and smplx_obj.exists()), "backend": "smplx", "device": _dev(), "ms": t_smplx}
 
             # Lighting SH attempt
             light_json = out_dir / "light_sh.json"
             light_backend = LightingBackend()
+            t0 = time.time()
             light_res = light_backend.compute(image_path) or {"sh9": [0.0] * 9}
+            t_light = int((time.time() - t0) * 1000)
             self._save_json(light_json, light_res)
             log.info("Lighting step: ok | SH saved")
             artifacts["light_sh"] = light_json
+            status_map["lighting"] = {"ok": True, "backend": "sh-relight", "device": "cpu", "ms": t_light}
 
             # Models resolution snapshot
             models_json = out_dir / "models.json"
             status_json = out_dir / "status.json"
             self._save_json(models_json, resolved)
-            status = {
-                "face": bool(face_res),
-                "pose": bool(pose_res),
-                "parsing": bool(seg_path and seg_path.exists()),
-                "depth": bool(depth_res),
-                "smplx": bool(smplx_obj and smplx_obj.exists()),
-                "lighting": True,
-            }
-            self._save_json(status_json, status)
-            log.info("PersonAnalysis complete | status=%s", status)
+            self._save_json(status_json, status_map)
+            log.info("PersonAnalysis complete | status=%s", status_map)
             artifacts["models"] = models_json
 
         return StageOutput(

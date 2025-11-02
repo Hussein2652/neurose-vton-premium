@@ -1,31 +1,23 @@
 # syntax=docker/dockerfile:1.6
-# GPU-first base with Torch preinstalled to avoid re-downloading
-ARG BASE_IMAGE=pytorch/pytorch:2.3.1-cuda11.8-cudnn8-runtime
-FROM ${BASE_IMAGE}
+# Clean, single-stage Dockerfile. No external repo refs. Strict caching.
+
+FROM pytorch/pytorch:2.3.1-cuda11.8-cudnn8-devel
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=0 \
     PIP_CACHE_DIR=/root/.cache/pip \
     TORCH_HOME=/app/runtime_cache/torch \
-    HF_HOME=/app/runtime_cache/hf
+    HF_HOME=/app/runtime_cache/hf \
+    NO_ALBUMENTATIONS_UPDATE=1 \
+    PYTHONWARNINGS="ignore::UserWarning:albumentations.__init__,ignore::UserWarning:onnxruntime.capi.onnxruntime_inference_collection" \
+    CUDA_HOME=/usr/local/cuda \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH} \
+    PATH=/usr/local/cuda/bin:${PATH}
 
 WORKDIR /app
 
-# Copy lockfile first so dependency layer is independent of source changes
-COPY requirements.lock /app/requirements.lock
-
-## Torch is already present in the base image; install system deps and project deps only
-
-# Create runtime dirs (separate from pip cache mount)
-RUN mkdir -p /app/runtime_cache /app/outputs
-
-# Upgrade pip using persistent pip cache
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip
-
-# Install system deps (cached layer): compilers + runtime libs for CV/ONNX builds
-# Use build cache for apt metadata and packages
+# System deps first: required to build some wheels (e.g., insightface)
 RUN --mount=type=cache,target=/var/cache/apt \
     --mount=type=cache,target=/var/lib/apt/lists \
     apt-get update && \
@@ -37,20 +29,26 @@ RUN --mount=type=cache,target=/var/cache/apt \
       pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Install runtime deps from lock file (torch stays from base image)
+# Install Python deps; cached by lockfile content only
+COPY requirements.lock /app/requirements.lock
+ARG PIP_VERSION=24.2
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "pip==${PIP_VERSION}"
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /app/requirements.lock
 
-# Copy source code and scripts (done after deps to preserve cache)
+# Runtime dirs
+RUN mkdir -p /app/runtime_cache /app/outputs
+
+# App code and scripts
 COPY neurose_vton /app/neurose_vton
 COPY scripts /app/scripts
 COPY pyproject.toml README.md /app/
 
-# Install the project itself without touching deps (so torch isn't reinstalled)
+# Install the project itself without touching deps (so Torch/deps remain cached)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -e . --no-deps
 
-# External bind mounts at runtime (read-only for models/code; read-write for outputs/cache)
 VOLUME ["/app/storage", "/app/manual_downloads", "/app/third_party", "/app/outputs", "/app/runtime_cache"]
 
 EXPOSE 8000

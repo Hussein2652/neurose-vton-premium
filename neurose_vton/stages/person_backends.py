@@ -216,8 +216,14 @@ class ParsingBackend:
             shutil.copyfile(image_path, in_img)
 
             # Build command
-            # Run SCHP extractor on CPU to avoid requiring CUDA toolkit in container
-            gpu_arg = 'None'
+            # Prefer GPU if available; requires CUDA toolkit in image
+            gpu_arg = '0'
+            try:
+                import torch  # type: ignore
+                if not torch.cuda.is_available():
+                    gpu_arg = 'None'
+            except Exception:
+                gpu_arg = 'None'
 
             cmd = [
                 sys.executable,
@@ -230,6 +236,10 @@ class ParsingBackend:
             ]
             # Execute
             env = os.environ.copy()
+            # Ensure CUDA_HOME for torch cpp extensions
+            env.setdefault("CUDA_HOME", "/usr/local/cuda")
+            env.setdefault("PATH", f"/usr/local/cuda/bin:{env.get('PATH','')}")
+            env.setdefault("LD_LIBRARY_PATH", f"/usr/local/cuda/lib64:{env.get('LD_LIBRARY_PATH','')}")
             # Prepend repo to PYTHONPATH so its local imports resolve
             env["PYTHONPATH"] = f"{repo}:{env.get('PYTHONPATH','')}"
             proc = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
@@ -255,11 +265,76 @@ class DepthBackend:
 
     def compute(self, image_path: Path) -> Optional[Any]:
         log = logging.getLogger("neurose_vton.person.depth")
-        # Try MiDaS via torch.hub using local cache (runtime_cache/torch/hub), seeded from storage if mounted
+        # 1) Try ZoeDepth with local checkpoint; install code if missing (user approved downloads)
         try:
             import torch  # type: ignore
             import numpy as np  # type: ignore
             from PIL import Image
+            ckpt = Path("storage/models/zoedepth_m12_nk/v1/ZoeD_M12_NK.pt").resolve()
+            if ckpt.exists():
+                try:
+                    try:
+                        from zoedepth.models.builder import build_model  # type: ignore
+                        from zoedepth.utils.config import get_config  # type: ignore
+                    except Exception:
+                        import sys
+                        subprocess.run([sys.executable, "-m", "pip", "install", "git+https://github.com/isl-org/ZoeDepth"], check=False)
+                        from zoedepth.models.builder import build_model  # type: ignore
+                        from zoedepth.utils.config import get_config  # type: ignore
+
+                    conf = get_config("zoedepth", "infer")
+                    model = build_model(conf)
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    model.to(device).eval()
+                    sd = torch.load(str(ckpt), map_location=device)
+                    state = sd.get("state_dict", sd)
+                    model.load_state_dict(state, strict=False)
+
+                    img = Image.open(image_path).convert('RGB')
+                    import torchvision.transforms as T  # type: ignore
+                    input_tensor = T.ToTensor()(img).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        out = model(input_tensor)
+                        if isinstance(out, (list, tuple)):
+                            depth = out[0]
+                        elif hasattr(out, 'keys'):
+                            depth = out.get('depth') or list(out.values())[0]
+                        else:
+                            depth = out
+                        if hasattr(depth, 'detach'):
+                            depth = depth.detach().squeeze()
+                        if hasattr(depth, 'cpu'):
+                            depth = depth.cpu().numpy()
+                    p = np.asarray(depth)
+                    pmin, pmax = float(p.min()), float(p.max())
+                    p = (p - pmin) / (pmax - pmin + 1e-8)
+                    depth_u8 = (p * 255.0).astype(np.uint8)
+                    gy, gx = np.gradient(p)
+                    nz = np.ones_like(p)
+                    normals = np.stack([gx, gy, nz], axis=-1)
+                    n = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-8
+                    normals = (normals / n + 1.0) * 0.5
+                    normals_u8 = (normals * 255.0).astype(np.uint8)
+                    log.info("Depth estimated via ZoeDepth")
+                    return {"depth": depth_u8, "normals": normals_u8, "_backend": "zoedepth"}
+                except Exception as e:
+                    log.warning("ZoeDepth failed (%s); falling back to MiDaS", e)
+        except Exception:
+            pass
+
+        # 2) Fallback: MiDaS via torch.hub (cached)
+        try:
+            import torch  # type: ignore
+            import numpy as np  # type: ignore
+            from PIL import Image
+            try:
+                storage_ckpt = Path("storage/models/torch/hub/checkpoints/dpt_hybrid_384.pt").resolve()
+                runtime_ckpt = Path("/app/runtime_cache/torch/hub/checkpoints/dpt_hybrid_384.pt").resolve()
+                if storage_ckpt.exists() and not runtime_ckpt.exists():
+                    runtime_ckpt.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(storage_ckpt, runtime_ckpt)
+            except Exception:
+                pass
             try:
                 torch.hub.set_dir(str(Path("/app/runtime_cache/torch/hub").resolve()))
             except Exception:
@@ -274,20 +349,22 @@ class DepthBackend:
                 prediction = midas(input_batch)
                 prediction = torch.nn.functional.interpolate(
                     prediction.unsqueeze(1), size=img.size[::-1], mode='bicubic', align_corners=False
-                ).squeeze().cpu().numpy()
-            # Normalize to 0-255
-            p = prediction
-            p = (p - p.min()) / (p.max() - p.min() + 1e-8)
-            depth_u8 = (p * 255).astype(np.uint8)
-            # Compute simple normals from depth gradient
+                ).squeeze()
+            if hasattr(prediction, 'cpu'):
+                prediction = prediction.cpu().numpy()
+            p = np.asarray(prediction)
+            pmin = float(p.min())
+            pmax = float(p.max())
+            p = (p - pmin) / (pmax - pmin + 1e-8)
+            depth_u8 = (p * 255.0).astype(np.uint8)
             gy, gx = np.gradient(p)
             nz = np.ones_like(p)
             normals = np.stack([gx, gy, nz], axis=-1)
             n = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-8
             normals = (normals / n + 1.0) * 0.5
-            normals_u8 = (normals * 255).astype(np.uint8)
+            normals_u8 = (normals * 255.0).astype(np.uint8)
             log.info("Depth estimated via MiDaS cached hub")
-            return {"depth": depth_u8, "normals": normals_u8}
+            return {"depth": depth_u8, "normals": normals_u8, "_backend": "midas"}
         except Exception as e:
             log.warning("Depth backend failed (%s); using placeholder", e)
             return None
