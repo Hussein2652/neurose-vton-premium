@@ -7,7 +7,7 @@ tqdm==4.66.4
 opencv-python-headless==4.10.0.84
 ultralytics==8.3.0
 insightface==0.7.3
-onnxruntime==1.17.3
+onnxruntime-gpu==1.15.1
 timm==0.9.12
 smplx==0.1.28
 pydantic==2.7.4

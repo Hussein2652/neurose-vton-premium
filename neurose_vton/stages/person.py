@@ -59,6 +59,7 @@ f 1 2 3
         try:
             from PIL import Image
             import numpy as np
+            import cv2  # type: ignore
             seg = Image.open(seg_path)
             arr = np.array(seg)
             # LIP label indices per SCHP (see dataset_settings in SCHP):
@@ -66,6 +67,10 @@ f 1 2 3
             hair_mask = (arr == 2).astype(np.uint8) * 255
             arms_mask = ((arr == 14) | (arr == 15)).astype(np.uint8) * 255
             hands_mask = (arr == 3).astype(np.uint8) * 255
+            # Light morphological closing to remove pinholes and thin gaps
+            kernel = np.ones((3, 3), np.uint8)
+            hair_mask = cv2.morphologyEx(hair_mask, cv2.MORPH_CLOSE, kernel)
+            hands_mask = cv2.morphologyEx(hands_mask, cv2.MORPH_CLOSE, kernel)
             Image.fromarray(hair_mask).save(hair)
             Image.fromarray(arms_mask).save(arms)
             Image.fromarray(hands_mask).save(hands)
@@ -74,6 +79,32 @@ f 1 2 3
             self._save_blank_png(hair, 64, 64, 1)
             self._save_blank_png(arms, 64, 64, 1)
             self._save_blank_png(hands, 64, 64, 1)
+
+    def _save_seg_overlay(self, image_path: Path, seg_path: Path, out_path: Path, alpha: float = 0.4) -> None:
+        try:
+            from PIL import Image
+            import numpy as np
+            base = Image.open(image_path).convert("RGB")
+            seg = Image.open(seg_path)
+            seg = seg.resize(base.size, Image.NEAREST)
+            seg_arr = np.array(seg)
+            # Simple color map for up to 20 classes
+            palette = np.array([
+                [0,0,0],[255,0,0],[255,128,0],[255,255,0],[128,255,0],[0,255,0],
+                [0,255,128],[0,255,255],[0,128,255],[0,0,255],[128,0,255],[255,0,255],
+                [255,0,128],[128,128,128],[128,64,0],[0,128,64],[64,0,128],[0,64,128],
+                [192,192,0],[0,192,192]
+            ], dtype=np.uint8)
+            colors = palette[seg_arr % len(palette)]
+            overlay = Image.fromarray(colors).convert("RGBA")
+            # Apply alpha
+            a = int(max(0.0, min(1.0, alpha)) * 255)
+            overlay.putalpha(a)
+            out = base.convert("RGBA")
+            out = Image.alpha_composite(out, overlay)
+            out.convert("RGB").save(out_path)
+        except Exception:
+            pass
 
     def run(self, image_path: Path, seed: int, trace_dir: Optional[Path] = None) -> StageOutput:
         log = logging.getLogger("neurose_vton.person")
@@ -96,6 +127,17 @@ f 1 2 3
                 return "cuda" if torch.cuda.is_available() else "cpu"
             except Exception:
                 return "cpu"
+        def _cuda_stats() -> Dict[str, int]:
+            try:
+                import torch  # type: ignore
+                if torch.cuda.is_available():
+                    return {
+                        "mem_alloc_mb": int(torch.cuda.memory_allocated() / 1e6),
+                        "mem_reserved_mb": int(torch.cuda.memory_reserved() / 1e6),
+                    }
+            except Exception:
+                pass
+            return {"mem_alloc_mb": 0, "mem_reserved_mb": 0}
         if trace_dir is not None:
             out_dir = trace_dir / "person"
             # Face detection + landmarks + embedding
@@ -119,18 +161,33 @@ f 1 2 3
             artifacts["face_detection"] = face_det_json
             artifacts["face_landmarks"] = face_lms_json
             artifacts["face_embedding"] = face_emb_json
-            status_map["face"] = {"ok": bool(face_res), "backend": "insightface", "device": "cpu", "ms": t_face}
+            s = {"ok": bool(face_res), "backend": "insightface", "device": _dev(), "ms": t_face}
+            s.update(_cuda_stats())
+            status_map["face"] = s
             # Try compute pose
             pose_json = out_dir / "pose.json"
+            pose_coco_json = out_dir / "pose_coco.json"
+            pose_body25_json = out_dir / "pose_body25.json"
             pose_backend = PoseBackend(model_dir=Path(resolved["openpose"]) if resolved["openpose"] else None)
             t0 = time.time()
             pose_res = pose_backend.compute(image_path)
             t_pose = int((time.time() - t0) * 1000)
             if pose_res is None:
                 self._save_json(pose_json, {"keypoints": [], "format": "BODY_25", "note": "placeholder"})
+                self._save_json(pose_coco_json, {"keypoints": [], "format": "COCO17", "note": "placeholder"})
+                self._save_json(pose_body25_json, {"keypoints": [], "format": "BODY_25", "note": "placeholder"})
                 log.warning("Pose step: fallback")
             else:
                 self._save_json(pose_json, pose_res)
+                # Split outputs if available
+                try:
+                    if isinstance(pose_res, dict):
+                        if "yolo" in pose_res and isinstance(pose_res["yolo"], dict):
+                            self._save_json(pose_coco_json, pose_res["yolo"]) 
+                        if "body_25" in pose_res and isinstance(pose_res["body_25"], dict):
+                            self._save_json(pose_body25_json, pose_res["body_25"]) 
+                except Exception:
+                    pass
                 try:
                     n = 0
                     if isinstance(pose_res, dict):
@@ -144,7 +201,11 @@ f 1 2 3
                 except Exception:
                     log.info("Pose step: ok")
             artifacts["pose"] = pose_json
-            status_map["pose"] = {"ok": bool(pose_res), "backend": "yolov8", "device": _dev(), "ms": t_pose}
+            artifacts["pose_coco"] = pose_coco_json
+            artifacts["pose_body25"] = pose_body25_json
+            s = {"ok": bool(pose_res), "backend": "yolov8", "device": _dev(), "ms": t_pose}
+            s.update(_cuda_stats())
+            status_map["pose"] = s
 
             # Segmentation via SCHP if available
             seg_png = out_dir / "segmentation.png"
@@ -166,8 +227,12 @@ f 1 2 3
             artifacts["segmentation"] = seg_png
             # Derive occluder masks from segmentation if possible
             self._save_occluder_masks(seg_png, out_dir)
+            # Save overlay
+            self._save_seg_overlay(image_path, seg_png, out_dir / "seg_overlay.png")
             log.info("Parsing step: occluder masks saved")
-            status_map["parsing"] = {"ok": bool(seg_path and seg_path.exists()), "backend": "schp", "device": _dev(), "ms": t_pars}
+            s = {"ok": bool(seg_path and seg_path.exists()), "backend": "schp", "device": _dev(), "ms": t_pars}
+            s.update(_cuda_stats())
+            status_map["parsing"] = s
 
             # Depth + normals via depth backend if available
             depth_png = out_dir / "depth.png"
@@ -199,7 +264,9 @@ f 1 2 3
                     bd = str(depth_res.get("_backend"))
             except Exception:
                 pass
-            status_map["depth"] = {"ok": bool(depth_res), "backend": bd, "device": _dev(), "ms": t_depth}
+            s = {"ok": bool(depth_res), "backend": bd, "device": _dev(), "ms": t_depth}
+            s.update(_cuda_stats())
+            status_map["depth"] = s
 
             # SMPL-X mesh if available
             mesh_obj = out_dir / "body_mesh.obj"
@@ -219,7 +286,9 @@ f 1 2 3
                 self._save_placeholder_mesh(mesh_obj)
                 log.warning("SMPL-X step: fallback (no mesh)")
             artifacts["body_mesh"] = mesh_obj
-            status_map["smplx"] = {"ok": bool(smplx_obj and smplx_obj.exists()), "backend": "smplx", "device": _dev(), "ms": t_smplx}
+            s = {"ok": bool(smplx_obj and smplx_obj.exists()), "backend": "smplx", "device": _dev(), "ms": t_smplx}
+            s.update(_cuda_stats())
+            status_map["smplx"] = s
 
             # Lighting SH attempt
             light_json = out_dir / "light_sh.json"
@@ -230,7 +299,8 @@ f 1 2 3
             self._save_json(light_json, light_res)
             log.info("Lighting step: ok | SH saved")
             artifacts["light_sh"] = light_json
-            status_map["lighting"] = {"ok": True, "backend": "sh-relight", "device": "cpu", "ms": t_light}
+            s = {"ok": True, "backend": "sh-relight", "device": "cpu", "ms": t_light}
+            status_map["lighting"] = s
 
             # Models resolution snapshot
             models_json = out_dir / "models.json"

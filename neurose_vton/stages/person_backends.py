@@ -312,6 +312,10 @@ class DepthBackend:
     def compute(self, image_path: Path) -> Optional[Any]:
         log = logging.getLogger("neurose_vton.person.depth")
         # 1) Try ZoeDepth with local checkpoint; strictly offline (no runtime installs)
+        # Allow user to skip via env for speed/stability
+        if os.environ.get("NEUROSE_SKIP_ZOEDEPTH", "0") in {"1", "true", "True"}:
+            log.info("Skipping ZoeDepth due to NEUROSE_SKIP_ZOEDEPTH")
+            return None
         try:
             import torch  # type: ignore
             import numpy as np  # type: ignore
@@ -393,6 +397,19 @@ class DepthBackend:
                     except Exception:
                         pass
                     model = build_model(conf)
+                    # Patch: some local ZoeDepth repos/variants lack a drop_path module on Blocks,
+                    # while checkpoints expect it. Ensure a no-op exists to keep forward compatible.
+                    try:
+                        import torch.nn as nn  # type: ignore
+                        for mod in model.modules():
+                            # Common attribute name in timm Blocks; attach Identity if missing
+                            if not hasattr(mod, 'drop_path'):
+                                try:
+                                    setattr(mod, 'drop_path', nn.Identity())
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                     model.to(device).eval()
                     sd = torch.load(str(ckpt), map_location=device)
@@ -405,6 +422,12 @@ class DepthBackend:
                     # HWC -> CHW
                     arr = arr.transpose(2, 0, 1)
                     input_tensor = torch.from_numpy(arr).unsqueeze(0).to(device)
+                    # Quick self-test to ensure forward works with this repo/ckpt combo
+                    try:
+                        with torch.no_grad():
+                            _ = model(torch.zeros(1, 3, 64, 64, device=device))
+                    except Exception as e:
+                        raise RuntimeError(f"ZoeDepth self-test failed: {e}")
                     with torch.no_grad():
                         out = model(input_tensor)
                         if isinstance(out, (list, tuple)):

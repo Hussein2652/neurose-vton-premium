@@ -13,6 +13,7 @@ services:
       NEUROSE_STRICT_DETERMINISM: "${NEUROSE_STRICT_DETERMINISM:-1}"
       NEUROSE_LOG_LEVEL: "${NEUROSE_LOG_LEVEL:-INFO}"
       NEUROSE_MODEL_DEPTH: "/app/storage/models/zoedepth_m12_nk/v1/ZoeD_M12_NK.pt"
+      NEUROSE_SKIP_ZOEDEPTH: "${NEUROSE_SKIP_ZOEDEPTH:-1}"
     volumes:
       - ./storage:/app/storage:ro
       - ./manual_downloads:/app/manual_downloads:ro
