@@ -414,7 +414,55 @@ class DepthBackend:
         if ckpt is None or not ckpt.exists():
             return None
 
-        # 2) Import zoedepth package first; if missing, try local repo via NEUROSE_ZOEDEPTH_REPO and third_party
+        # 2a) Try loading via local hubconf using a local pretrained_resource (preferred)
+        repo_paths: List[Path] = []
+        env_repo = os.environ.get("NEUROSE_ZOEDEPTH_REPO")
+        if env_repo:
+            repo_paths.append(Path(env_repo).resolve())
+        repo_paths.append(Path("third_party/zoedepth").resolve())
+        cache_repo = (PATHS.runtime_cache / "zoedepth_repo").resolve()
+        repo_paths.append(cache_repo)
+
+        variant = "zoedepth_nk" if "NK" in ckpt.name.upper() else "zoedepth"
+        hub_entries = ["ZoeD_M12_NK", "ZoeD_NK"] if variant == "zoedepth_nk" else ["ZoeD_M12_N", "ZoeD_N"]
+        for repo in repo_paths:
+            hubconf = repo / "hubconf.py"
+            if hubconf.exists():
+                for entry in hub_entries:
+                    try:
+                        model = torch.hub.load(str(repo), entry, source='local', pretrained=True,
+                                               config_mode='infer', pretrained_resource=f"local::{ckpt}")
+                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                        model.to(device).eval()
+                        # Forward below
+                        img = Image.open(image_path).convert('RGB')
+                        arr = np.asarray(img).astype('float32') / 255.0
+                        H, W = arr.shape[:2]
+                        x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
+                        with torch.inference_mode():
+                            out = model(x)
+                            if isinstance(out, (list, tuple)):
+                                depth = out[0]
+                            elif isinstance(out, dict):
+                                depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                            else:
+                                depth = out
+                            depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
+                            depth = depth.squeeze().detach().cpu().float().numpy()
+                        p = depth
+                        pmin, pmax = float(p.min()), float(p.max())
+                        p = (p - pmin) / (pmax - pmin + 1e-8)
+                        depth_u8 = (p * 255.0).astype(np.uint8)
+                        gy, gx = np.gradient(p)
+                        nz = np.ones_like(p)
+                        normals = np.stack([gx, gy, nz], axis=-1)
+                        n = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-8
+                        normals = (normals / n + 1.0) * 0.5
+                        normals_u8 = (normals * 255.0).astype(np.uint8)
+                        return {"depth": depth_u8, "normals": normals_u8, "_backend": ("zoedepth_m12_nk" if variant == "zoedepth_nk" else "zoedepth")}
+                    except Exception:
+                        continue
+        # 2b) Import zoedepth package; if missing, try local repo via NEUROSE_ZOEDEPTH_REPO and third_party
         build_model = None
         zget_config = None
         try:
@@ -422,13 +470,6 @@ class DepthBackend:
             from zoedepth.utils.config import get_config as _gc  # type: ignore
             build_model, zget_config = _bm, _gc
         except Exception:
-            repo_paths: List[Path] = []
-            env_repo = os.environ.get("NEUROSE_ZOEDEPTH_REPO")
-            if env_repo:
-                repo_paths.append(Path(env_repo).resolve())
-            repo_paths.append(Path("third_party/zoedepth").resolve())
-            cache_repo = (PATHS.runtime_cache / "zoedepth_repo").resolve()
-            repo_paths.append(cache_repo)
             for repo in repo_paths:
                 if not repo.exists():
                     continue
@@ -447,7 +488,6 @@ class DepthBackend:
 
         # 3) Build config and model without any pretrained URL
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        variant = "zoedepth_nk" if "NK" in ckpt.name.upper() else "zoedepth"
         conf = zget_config(variant, "infer")
         for key in ("pretrained_resource", "pretrained_model", "pretrained_resource_model"):
             try:
