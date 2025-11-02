@@ -401,51 +401,85 @@ class DepthBackend:
                 break
         if not ckpt or not ckpt.exists():
             return None
-        # Import zoedepth either from installed site-packages or local folders
-        try:
-            from zoedepth.models.builder import build_model  # type: ignore
-            from zoedepth.utils.config import get_config  # type: ignore
-        except Exception:
-            # Try local candidates in order: third_party, cached extracted zip
-            # Highest priority: explicit env override
-            env_repo = os.environ.get("NEUROSE_ZOEDEPTH_REPO")
-            local_repo = Path(env_repo).resolve() if env_repo else Path("third_party/zoedepth").resolve()
-            cache_repo = (PATHS.runtime_cache / "zoedepth_repo").resolve()
-            if not local_repo.exists():
-                # If a zip exists under manual_downloads, extract it into runtime_cache (no writes to mounts)
-                zips: List[Path] = []
+        # Import zoedepth either via local hubconf (preferred) or from package
+        env_repo = os.environ.get("NEUROSE_ZOEDEPTH_REPO")
+        repo_candidates: List[Path] = []
+        if env_repo:
+            repo_candidates.append(Path(env_repo).resolve())
+        repo_candidates.append(Path("third_party/zoedepth").resolve())
+        cache_repo = (PATHS.runtime_cache / "zoedepth_repo").resolve()
+        repo_candidates.append(cache_repo)
+
+        def _ensure_cache_extract() -> None:
+            if cache_repo.exists():
+                return
+            zips: List[Path] = []
+            try:
+                manual_zroot = (PATHS.manual / "zoedepth_downloads").resolve()
+                if manual_zroot.exists():
+                    for z in manual_zroot.glob("ZoeDepth*.zip"):
+                        zips.append(z)
+            except Exception:
+                pass
+            if zips:
+                import zipfile
+                cache_repo.mkdir(parents=True, exist_ok=True)
                 try:
-                    manual_zroot = (PATHS.manual / "zoedepth_downloads").resolve()
-                    if manual_zroot.exists():
-                        for z in manual_zroot.glob("ZoeDepth*.zip"):
-                            zips.append(z)
+                    with zipfile.ZipFile(str(zips[0]), 'r') as zf:
+                        zf.extractall(str(cache_repo))
                 except Exception:
                     pass
-                if zips and not cache_repo.exists():
-                    import zipfile
-                    cache_repo.mkdir(parents=True, exist_ok=True)
+
+        # Try local hubconf first for the chosen repo
+        variant = "zoedepth_nk" if "NK" in ckpt.name.upper() else "zoedepth"
+        hub_loaded = False
+        for repo_dir in repo_candidates:
+            if not repo_dir.exists():
+                if repo_dir == cache_repo:
+                    _ensure_cache_extract()
+                if not repo_dir.exists():
+                    continue
+            hubconf = repo_dir / "hubconf.py"
+            if hubconf.exists():
+                try:
+                    entry = 'ZoeD_NK' if variant == 'zoedepth_nk' else 'ZoeD_N'
+                    model = torch.hub.load(str(repo_dir), entry, source='local', pretrained=False)
+                    hub_loaded = True
+                    break
+                except Exception:
+                    pass
+
+        if not hub_loaded:
+            # Fallback to importing builder from package paths
+            for repo_dir in repo_candidates:
+                if repo_dir.exists():
+                    sys.path.insert(0, str(repo_dir))
+                    # also add first-level subdir (e.g., ZoeDepth-main)
                     try:
-                        with zipfile.ZipFile(str(zips[0]), 'r') as zf:
-                            zf.extractall(str(cache_repo))
+                        subs = list(repo_dir.iterdir())
+                        for s in subs:
+                            if s.is_dir():
+                                sys.path.insert(0, str(s))
+                                break
                     except Exception:
                         pass
-            # Prefer third_party if present; else cached extracted
-            if local_repo.exists():
-                sys.path.insert(0, str(local_repo))
-            elif cache_repo.exists():
-                # The zip typically unpacks to a folder like ZoeDepth-main
-                # Add both cache_repo and its first-level subdir if exists
-                sys.path.insert(0, str(cache_repo))
-                try:
-                    subs = list(cache_repo.iterdir())
-                    for s in subs:
-                        if s.is_dir():
-                            sys.path.insert(0, str(s))
-                            break
-                except Exception:
-                    pass
             from zoedepth.models.builder import build_model  # type: ignore
             from zoedepth.utils.config import get_config  # type: ignore
+            conf = get_config(variant, "infer")
+            # prevent pretrained URL usage
+            for key in ("pretrained_resource", "pretrained_model", "pretrained_resource_model"):
+                try:
+                    setattr(conf, key, None)
+                except Exception:
+                    pass
+            try:
+                if hasattr(conf, "zoedepth") and isinstance(conf.zoedepth, dict):
+                    conf.zoedepth["pretrained_resource"] = None
+                if hasattr(conf, "zoedepth_nk") and isinstance(conf.zoedepth_nk, dict):
+                    conf.zoedepth_nk["pretrained_resource"] = None
+            except Exception:
+                pass
+            model = build_model(conf)
 
         # Pick NK variant if checkpoint name suggests it; prevents wrong weights mapping
         variant = "zoedepth_nk" if "NK" in ckpt.name.upper() else "zoedepth"
@@ -467,7 +501,7 @@ class DepthBackend:
         # Patch missing drop_path in some repos
         try:
             import torch.nn as nn  # type: ignore
-            for mod in model.modules():
+            for mod in getattr(model, 'modules', lambda: [])():
                 if not hasattr(mod, 'drop_path'):
                     try:
                         setattr(mod, 'drop_path', nn.Identity())
