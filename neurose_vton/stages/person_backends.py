@@ -376,7 +376,22 @@ class DepthBackend:
                         from zoedepth.models.builder import build_model  # type: ignore
                         from zoedepth.utils.config import get_config  # type: ignore
 
-                    conf = get_config("zoedepth", "infer")
+                    # Pick NK variant if checkpoint name suggests it; prevents wrong weights mapping
+                    variant = "zoedepth_nk" if "NK" in ckpt.name.upper() else "zoedepth"
+                    conf = get_config(variant, "infer")
+                    # Best-effort to prevent any pretrained URL download from config
+                    for key in ("pretrained_resource", "pretrained_model", "pretrained_resource_model"):
+                        try:
+                            setattr(conf, key, None)
+                        except Exception:
+                            pass
+                    try:
+                        if hasattr(conf, "zoedepth") and isinstance(conf.zoedepth, dict):
+                            conf.zoedepth["pretrained_resource"] = None
+                        if hasattr(conf, "zoedepth_nk") and isinstance(conf.zoedepth_nk, dict):
+                            conf.zoedepth_nk["pretrained_resource"] = None
+                    except Exception:
+                        pass
                     model = build_model(conf)
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                     model.to(device).eval()
@@ -441,22 +456,37 @@ class DepthBackend:
             transforms = torch.hub.load('intel-isl/MiDaS', 'transforms')
             transform = transforms.dpt_transform
             img = Image.open(image_path).convert('RGB')
-            # Ensure ndarray input to avoid PIL Image arithmetic inside transform
-            import numpy as np  # type: ignore
-            img_np = np.asarray(img)
-            input_batch = transform(img_np).unsqueeze(0)
+            # Some MiDaS transform versions expect numpy arrays; try both PIL and np
+            try:
+                input_t = transform(img)
+            except Exception:
+                import numpy as np  # type: ignore
+                input_t = transform(np.asarray(img))
+            # Ensure we got a [B, C, H, W] tensor for inference
+            import torch  # type: ignore
+            if isinstance(input_t, (list, tuple)):
+                input_t = input_t[0]
+            input_batch = input_t.unsqueeze(0) if hasattr(input_t, 'unsqueeze') else torch.as_tensor(input_t).unsqueeze(0)
             with torch.no_grad():
-                prediction = midas(input_batch)
-                prediction = torch.nn.functional.interpolate(
-                    prediction.unsqueeze(1), size=img.size[::-1], mode='bicubic', align_corners=False
-                ).squeeze()
-            if hasattr(prediction, 'cpu'):
-                prediction = prediction.cpu().numpy()
-            p = np.asarray(prediction)
+                pred = midas(input_batch)
+                # Normalize to [B,1,H,W]
+                if pred.dim() == 3:
+                    pred = pred.unsqueeze(1)
+                elif pred.dim() == 4 and pred.shape[1] != 1:
+                    pred = pred[:, :1, ...]
+                pred = torch.nn.functional.interpolate(
+                    pred, size=img.size[::-1], mode='bicubic', align_corners=False
+                )
+            arr = pred.detach().cpu().numpy()
+            # Reduce to 2D HxW
+            while arr.ndim > 2:
+                arr = arr[0]
+            p = np.asarray(arr)
             pmin = float(p.min())
             pmax = float(p.max())
             p = (p - pmin) / (pmax - pmin + 1e-8)
             depth_u8 = (p * 255.0).astype(np.uint8)
+            # Compute normals from 2D depth map
             gy, gx = np.gradient(p)
             nz = np.ones_like(p)
             normals = np.stack([gx, gy, nz], axis=-1)
