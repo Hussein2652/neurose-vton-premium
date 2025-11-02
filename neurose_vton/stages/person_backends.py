@@ -442,8 +442,20 @@ class DepthBackend:
             hubconf = repo_dir / "hubconf.py"
             if hubconf.exists():
                 try:
-                    entry = 'ZoeD_NK' if variant == 'zoedepth_nk' else 'ZoeD_N'
-                    model = torch.hub.load(str(repo_dir), entry, source='local', pretrained=False)
+                    entries = (
+                        ['ZoeD_M12_NK', 'ZoeD_NK'] if variant == 'zoedepth_nk' else ['ZoeD_M12_N', 'ZoeD_N']
+                    )
+                    last_err: Optional[Exception] = None
+                    for entry in entries:
+                        try:
+                            model = torch.hub.load(str(repo_dir), entry, source='local', pretrained=False)
+                            hub_loaded = True
+                            break
+                        except Exception as e:
+                            last_err = e
+                            continue
+                    if not hub_loaded and last_err is not None:
+                        raise last_err
                     hub_loaded = True
                     break
                 except Exception:
