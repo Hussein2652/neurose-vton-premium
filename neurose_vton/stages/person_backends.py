@@ -401,13 +401,15 @@ class DepthBackend:
                 break
         if not ckpt or not ckpt.exists():
             return None
-        # Import zoedepth either from installed site-packages or local third_party
+        # Import zoedepth either from installed site-packages or local folders
         try:
             from zoedepth.models.builder import build_model  # type: ignore
             from zoedepth.utils.config import get_config  # type: ignore
         except Exception:
             # Try local candidates in order: third_party, cached extracted zip
-            local_repo = Path("third_party/zoedepth").resolve()
+            # Highest priority: explicit env override
+            env_repo = os.environ.get("NEUROSE_ZOEDEPTH_REPO")
+            local_repo = Path(env_repo).resolve() if env_repo else Path("third_party/zoedepth").resolve()
             cache_repo = (PATHS.runtime_cache / "zoedepth_repo").resolve()
             if not local_repo.exists():
                 # If a zip exists under manual_downloads, extract it into runtime_cache (no writes to mounts)
