@@ -337,9 +337,42 @@ class DepthBackend:
                         from zoedepth.models.builder import build_model  # type: ignore
                         from zoedepth.utils.config import get_config  # type: ignore
                     except Exception:
+                        # Try local candidates in order: third_party, cached extracted zip
                         local_repo = Path("third_party/zoedepth").resolve()
+                        cache_repo = (PATHS.runtime_cache / "zoedepth_repo").resolve()
+                        if not local_repo.exists():
+                            # If a zip exists under manual_downloads, extract it into runtime_cache (no writes to mounts)
+                            zips: List[Path] = []
+                            try:
+                                manual_zroot = (PATHS.manual / "zoedepth_downloads").resolve()
+                                if manual_zroot.exists():
+                                    for z in manual_zroot.glob("ZoeDepth*.zip"):
+                                        zips.append(z)
+                            except Exception:
+                                pass
+                            if zips and not cache_repo.exists():
+                                import zipfile
+                                cache_repo.mkdir(parents=True, exist_ok=True)
+                                try:
+                                    with zipfile.ZipFile(str(zips[0]), 'r') as zf:
+                                        zf.extractall(str(cache_repo))
+                                except Exception:
+                                    pass
+                        # Prefer third_party if present; else cached extracted
                         if local_repo.exists():
                             sys.path.insert(0, str(local_repo))
+                        elif cache_repo.exists():
+                            # The zip typically unpacks to a folder like ZoeDepth-main
+                            # Add both cache_repo and its first-level subdir if exists
+                            sys.path.insert(0, str(cache_repo))
+                            try:
+                                subs = list(cache_repo.iterdir())
+                                for s in subs:
+                                    if s.is_dir():
+                                        sys.path.insert(0, str(s))
+                                        break
+                            except Exception:
+                                pass
                         from zoedepth.models.builder import build_model  # type: ignore
                         from zoedepth.utils.config import get_config  # type: ignore
 
