@@ -461,13 +461,29 @@ class DepthBackend:
                 conf.zoedepth_nk["pretrained_resource"] = None
         except Exception:
             pass
-        model = build_model(conf).to(device).eval()
+        try:
+            model = build_model(conf).to(device).eval()
+        except Exception as e:
+            logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth build failed: %s", e)
+            raise
+        # Ensure any timm Blocks have a drop_path attribute to avoid forward errors
+        try:
+            import torch.nn as nn  # type: ignore
+            for mod in getattr(model, 'modules', lambda: [])():
+                if not hasattr(mod, 'drop_path'):
+                    try:
+                        setattr(mod, 'drop_path', nn.Identity())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # 4) Load checkpoint
         sd = torch.load(str(ckpt), map_location=device)
         state = sd.get("state_dict", sd.get("model", sd))
         try:
             model.load_state_dict(state, strict=False)
-        except Exception:
+        except Exception as e:
+            logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth load_state failed: %s — applying drop_path patch", e)
             # Patch missing drop_path in some repos
             try:
                 import torch.nn as nn  # type: ignore
@@ -486,16 +502,20 @@ class DepthBackend:
         arr = np.asarray(img).astype('float32') / 255.0
         H, W = arr.shape[:2]
         x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
-        with torch.inference_mode():
-            out = model(x)
-            if isinstance(out, (list, tuple)):
-                depth = out[0]
-            elif isinstance(out, dict):
-                depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
-            else:
-                depth = out
-            depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
-            depth = depth.squeeze().detach().cpu().float().numpy()
+        try:
+            with torch.inference_mode():
+                out = model(x)
+                if isinstance(out, (list, tuple)):
+                    depth = out[0]
+                elif isinstance(out, dict):
+                    depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                else:
+                    depth = out
+                depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
+                depth = depth.squeeze().detach().cpu().float().numpy()
+        except Exception as e:
+            logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth forward failed: %s", e)
+            raise
         # 6) Normalize and normals
         p = depth
         pmin, pmax = float(p.min()), float(p.max())
