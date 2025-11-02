@@ -451,37 +451,28 @@ class DepthBackend:
                 torch.hub.set_dir(str(Path("/app/runtime_cache/torch/hub").resolve()))
             except Exception:
                 pass
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             midas = torch.hub.load('intel-isl/MiDaS', 'DPT_Hybrid')
-            midas.eval()
-            transforms = torch.hub.load('intel-isl/MiDaS', 'transforms')
-            transform = transforms.dpt_transform
+            midas.to(device).eval()
             img = Image.open(image_path).convert('RGB')
-            # Some MiDaS transform versions expect numpy arrays; try both PIL and np
-            try:
-                input_t = transform(img)
-            except Exception:
-                import numpy as np  # type: ignore
-                input_t = transform(np.asarray(img))
-            # Ensure we got a [B, C, H, W] tensor for inference
-            import torch  # type: ignore
-            if isinstance(input_t, (list, tuple)):
-                input_t = input_t[0]
-            input_batch = input_t.unsqueeze(0) if hasattr(input_t, 'unsqueeze') else torch.as_tensor(input_t).unsqueeze(0)
+            W, H = img.size
+            # Manual preprocessing (ImageNet normalization, 384x384)
+            import numpy as np  # type: ignore
+            im_resized = img.resize((384, 384))
+            arr = np.asarray(im_resized).astype('float32') / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype='float32')
+            std = np.array([0.229, 0.224, 0.225], dtype='float32')
+            arr = (arr - mean) / std
+            chw = arr.transpose(2, 0, 1)  # CHW
+            input_batch = torch.from_numpy(chw).unsqueeze(0).to(device)
             with torch.no_grad():
                 pred = midas(input_batch)
-                # Normalize to [B,1,H,W]
                 if pred.dim() == 3:
                     pred = pred.unsqueeze(1)
                 elif pred.dim() == 4 and pred.shape[1] != 1:
                     pred = pred[:, :1, ...]
-                pred = torch.nn.functional.interpolate(
-                    pred, size=img.size[::-1], mode='bicubic', align_corners=False
-                )
-            arr = pred.detach().cpu().numpy()
-            # Reduce to 2D HxW
-            while arr.ndim > 2:
-                arr = arr[0]
-            p = np.asarray(arr)
+                pred = torch.nn.functional.interpolate(pred, size=(H, W), mode='bicubic', align_corners=False)
+            p = pred[0, 0].detach().cpu().numpy()
             pmin = float(p.min())
             pmax = float(p.max())
             p = (p - pmin) / (pmax - pmin + 1e-8)
