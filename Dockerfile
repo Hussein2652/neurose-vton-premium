@@ -12,8 +12,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Copy only dependency metadata first to leverage Docker layer caching
-COPY pyproject.toml /app/
+# Copy lockfile first so dependency layer is independent of source changes
+COPY requirements.lock /app/requirements.lock
 
 ## Torch is already present in the base image; install system deps and project deps only
 
@@ -37,24 +37,14 @@ RUN --mount=type=cache,target=/var/cache/apt \
       pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Install runtime deps explicitly (torch stays from base image)
+# Install runtime deps from lock file (torch stays from base image)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
-    fastapi>=0.110 \
-    "uvicorn[standard]">=0.24 \
-    python-multipart>=0.0.6 \
-    pillow>=10.0 \
-    tqdm>=4.66 \
-    opencv-python-headless>=4.8 \
-    ultralytics>=8.0.0 \
-    insightface>=0.7.3 \
-    onnxruntime-gpu>=1.16.0 \
-    smplx>=0.1.28
+    pip install -r /app/requirements.lock
 
 # Copy source code and scripts (done after deps to preserve cache)
 COPY neurose_vton /app/neurose_vton
 COPY scripts /app/scripts
-COPY README.md /app/
+COPY pyproject.toml README.md /app/
 
 # Install the project itself without touching deps (so torch isn't reinstalled)
 RUN --mount=type=cache,target=/root/.cache/pip \
