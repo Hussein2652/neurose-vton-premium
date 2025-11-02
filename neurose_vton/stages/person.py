@@ -132,7 +132,15 @@ f 1 2 3
             else:
                 self._save_json(pose_json, pose_res)
                 try:
-                    log.info("Pose step: ok | %d keypoints", len(pose_res.get("keypoints", [])))
+                    n = 0
+                    if isinstance(pose_res, dict):
+                        if "keypoints" in pose_res:
+                            n = len(pose_res.get("keypoints", []))
+                        elif "body_25" in pose_res and isinstance(pose_res["body_25"], dict):
+                            n = len(pose_res["body_25"].get("keypoints", []))
+                        elif "yolo" in pose_res and isinstance(pose_res["yolo"], dict):
+                            n = len(pose_res["yolo"].get("keypoints", []))
+                    log.info("Pose step: ok | %d keypoints", n)
                 except Exception:
                     log.info("Pose step: ok")
             artifacts["pose"] = pose_json
@@ -164,7 +172,7 @@ f 1 2 3
             # Depth + normals via depth backend if available
             depth_png = out_dir / "depth.png"
             normals_png = out_dir / "normals.png"
-            depth_backend = DepthBackend(model_dir=None)
+            depth_backend = DepthBackend(model_dir=Path(resolved["depth"]) if resolved["depth"] else None)
             t0 = time.time()
             depth_res = depth_backend.compute(image_path)
             t_depth = int((time.time() - t0) * 1000)

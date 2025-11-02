@@ -135,15 +135,48 @@ class PoseBackend:
                         break
             model = YOLO(weight or "yolov8n-pose.pt")
             results = model(source=str(image_path), imgsz=640, device=0 if self._has_cuda() else "cpu")
-            # Convert first result to BODY_25-like list
-            kps = []
+            # Convert first result to COCO17 list
+            coco17: List[List[float]] = []
             for r in results:
                 if hasattr(r, "keypoints") and r.keypoints is not None:
                     k = r.keypoints.xy[0].tolist()
-                    kps = [[float(x), float(y)] for x, y in k]
+                    coco17 = [[float(x), float(y)] for x, y in k]
                     break
-            log.info("Pose estimated with YOLOv8; points=%d", len(kps))
-            return {"format": "YOLOv8", "keypoints": kps}
+            log.info("Pose estimated with YOLOv8; points=%d", len(coco17))
+            # Derive BODY_25 approximation
+            def _mid(a: List[float], b: List[float]) -> List[float]:
+                return [float((a[0] + b[0]) / 2.0), float((a[1] + b[1]) / 2.0)]
+            body25: List[List[float]] = []
+            if len(coco17) >= 17:
+                nose = coco17[0]
+                leye, reye = coco17[1], coco17[2]
+                lear, rear = coco17[3], coco17[4]
+                lsho, rsho = coco17[5], coco17[6]
+                lelb, relb = coco17[7], coco17[8]
+                lwri, rwri = coco17[9], coco17[10]
+                lhip, rhip = coco17[11], coco17[12]
+                lknee, rknee = coco17[13], coco17[14]
+                lank, rank = coco17[15], coco17[16]
+                neck = _mid(lsho, rsho)
+                midhip = _mid(lhip, rhip)
+                # Map as close as possible
+                body25 = [
+                    nose,                 # 0 Nose
+                    neck,                 # 1 Neck
+                    rsho, relb, rwri,    # 2-4 Right arm
+                    lsho, lelb, lwri,    # 5-7 Left arm
+                    midhip,               # 8 MidHip
+                    rhip, rknee, rank,    # 9-11 Right leg
+                    lhip, lknee, lank,    # 12-14 Left leg
+                    reye, leye, rear, lear,  # 15-18 facial
+                    lank, lank, lank,     # 19-21 Left foot (approx from ankle)
+                    rank, rank, rank,     # 22-24 Right foot (approx from ankle)
+                ]
+            return {
+                "format": "yolov8+coco17_to_body25",
+                "yolo": {"format": "COCO17", "keypoints": coco17},
+                "body_25": {"format": "BODY_25", "keypoints": body25, "approx": True},
+            }
         except Exception as e:
             log.warning("YOLOv8 pose failed (%s); falling back", e)
             pass
@@ -253,6 +286,19 @@ class ParsingBackend:
             out_img = out_dir / (image_path.stem + ".png")
             if out_img.exists():
                 return out_img
+            # Handle .jpeg quirk in SCHP which slices last 4 chars only
+            name_lower = image_path.name.lower()
+            for ext in (".jpeg", ".jpg", ".png"):
+                if name_lower.endswith(ext):
+                    base = image_path.name[: -len(ext)]
+                    alt = out_dir / (base + ".png")
+                    if alt.exists():
+                        return alt
+                    break
+            # Fallback: return the first png in out_dir if any
+            cand = list(out_dir.glob("*.png"))
+            if cand:
+                return cand[0]
             return None
         except Exception as e:
             log.exception("SCHP parsing exception: %s", e)
@@ -265,20 +311,35 @@ class DepthBackend:
 
     def compute(self, image_path: Path) -> Optional[Any]:
         log = logging.getLogger("neurose_vton.person.depth")
-        # 1) Try ZoeDepth with local checkpoint; install code if missing (user approved downloads)
+        # 1) Try ZoeDepth with local checkpoint; strictly offline (no runtime installs)
         try:
             import torch  # type: ignore
             import numpy as np  # type: ignore
             from PIL import Image
-            ckpt = Path("storage/models/zoedepth_m12_nk/v1/ZoeD_M12_NK.pt").resolve()
-            if ckpt.exists():
+            # Resolve checkpoint: prefer provided model_dir; else known storage path
+            ckpt: Optional[Path] = None
+            candidates: List[Path] = []
+            if self.model_dir:
+                if self.model_dir.is_file():
+                    candidates.append(self.model_dir)
+                else:
+                    candidates += list(self.model_dir.rglob("ZoeD_*NK*.pt"))
+                    candidates += list(self.model_dir.rglob("ZoeD_*.pt"))
+            candidates.append(Path("storage/models/zoedepth_m12_nk/v1/ZoeD_M12_NK.pt").resolve())
+            for c in candidates:
+                if c.exists():
+                    ckpt = c
+                    break
+            if ckpt and ckpt.exists():
                 try:
+                    # Import zoedepth either from installed site-packages or local third_party
                     try:
                         from zoedepth.models.builder import build_model  # type: ignore
                         from zoedepth.utils.config import get_config  # type: ignore
                     except Exception:
-                        import sys
-                        subprocess.run([sys.executable, "-m", "pip", "install", "git+https://github.com/isl-org/ZoeDepth"], check=False)
+                        local_repo = Path("third_party/zoedepth").resolve()
+                        if local_repo.exists():
+                            sys.path.insert(0, str(local_repo))
                         from zoedepth.models.builder import build_model  # type: ignore
                         from zoedepth.utils.config import get_config  # type: ignore
 
@@ -291,8 +352,11 @@ class DepthBackend:
                     model.load_state_dict(state, strict=False)
 
                     img = Image.open(image_path).convert('RGB')
-                    import torchvision.transforms as T  # type: ignore
-                    input_tensor = T.ToTensor()(img).unsqueeze(0).to(device)
+                    # Avoid torchvision dependency: manual ToTensor
+                    arr = np.asarray(img).astype('float32') / 255.0
+                    # HWC -> CHW
+                    arr = arr.transpose(2, 0, 1)
+                    input_tensor = torch.from_numpy(arr).unsqueeze(0).to(device)
                     with torch.no_grad():
                         out = model(input_tensor)
                         if isinstance(out, (list, tuple)):
@@ -344,7 +408,10 @@ class DepthBackend:
             transforms = torch.hub.load('intel-isl/MiDaS', 'transforms')
             transform = transforms.dpt_transform
             img = Image.open(image_path).convert('RGB')
-            input_batch = transform(img).unsqueeze(0)
+            # Ensure ndarray input to avoid PIL Image arithmetic inside transform
+            import numpy as np  # type: ignore
+            img_np = np.asarray(img)
+            input_batch = transform(img_np).unsqueeze(0)
             with torch.no_grad():
                 prediction = midas(input_batch)
                 prediction = torch.nn.functional.interpolate(
