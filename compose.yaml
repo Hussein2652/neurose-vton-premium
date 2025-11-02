@@ -4,9 +4,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        # Default to CUDA 11.8 (RTX 30‑series friendly). Override via .env if needed.
-        PYTORCH_INDEX_URL: ${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu118}
     ports:
       - "8000:8000"
     environment:

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.staticfiles import StaticFiles
 
 from ..config import PATHS, SETTINGS
@@ -56,6 +56,16 @@ def _trace_url(trace_dir: Path | None) -> str | None:
         return f"/files/{rel.as_posix()}"
     except Exception:
         return None
+
+
+@app.get("/")
+def index() -> RedirectResponse:
+    return RedirectResponse(url="/ui")
+
+
+@app.get("/web")
+def web_alias() -> RedirectResponse:
+    return RedirectResponse(url="/ui")
 
 
 @app.get("/ui")

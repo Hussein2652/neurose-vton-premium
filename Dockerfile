@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.6
-# Minimal dev Dockerfile (real image to be hardened in later sprints)
-FROM python:3.10-slim
+# GPU-first base with Torch preinstalled to avoid re-downloading
+ARG BASE_IMAGE=pytorch/pytorch:2.3.1-cuda11.8-cudnn8-runtime
+FROM ${BASE_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -14,17 +15,7 @@ WORKDIR /app
 # Copy only dependency metadata first to leverage Docker layer caching
 COPY pyproject.toml /app/
 
-# System deps (cached layer): compilers + runtime libs for CV/ONNX builds
-# Use build cache for apt metadata and packages
-RUN --mount=type=cache,target=/var/cache/apt \
-    --mount=type=cache,target=/var/lib/apt/lists \
-    apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      build-essential \
-      gcc g++ make cmake git \
-      libgl1 libglib2.0-0 \
-      pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+## Torch is already present in the base image; install system deps and project deps only
 
 # Create runtime dirs (separate from pip cache mount)
 RUN mkdir -p /app/runtime_cache /app/outputs
@@ -33,14 +24,20 @@ RUN mkdir -p /app/runtime_cache /app/outputs
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip
 
-# Allow selecting PyTorch channel (CPU by default). Override at build with:
-#   --build-arg PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
-ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
-# Install PyTorch first from the chosen channel (with pip cache mount)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --index-url ${PYTORCH_INDEX_URL} torch torchvision
+# Install system deps (cached layer): compilers + runtime libs for CV/ONNX builds
+# Use build cache for apt metadata and packages
+RUN --mount=type=cache,target=/var/cache/apt \
+    --mount=type=cache,target=/var/lib/apt/lists \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential \
+      gcc g++ make cmake git \
+      ninja-build \
+      libgl1 libglib2.0-0 \
+      pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install runtime deps explicitly to avoid re-resolving torch later
+# Install runtime deps explicitly (torch stays from base image)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     fastapi>=0.110 \

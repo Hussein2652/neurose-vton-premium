@@ -8,6 +8,7 @@ import shutil
 import sys
 import os
 import logging
+from ..config import PATHS
 
 
 def _load_image(path: Path):
@@ -38,6 +39,36 @@ class FaceIDBackend:
         except Exception:
             self._lib = None
 
+    def _prepare_models(self) -> tuple[str, Optional[Path]]:
+        """Return (pack_name, writable_root) for InsightFace models.
+        If storage models are available under a read-only mount, copy them into
+        a writable cache: PATHS.runtime_cache/insightface/models/<pack>.
+        """
+        # Decide pack name based on provided model_dir path
+        pack = "buffalo_l"
+        if self.model_dir:
+            pstr = str(self.model_dir).lower()
+            if "antelopev2" in pstr:
+                pack = "antelopev2"
+            elif "buffalo" in pstr:
+                pack = "buffalo_l"
+        writable_root = PATHS.runtime_cache / "insightface"
+        try:
+            if self.model_dir and self.model_dir.exists():
+                src = self.model_dir
+                dst = writable_root / "models" / pack
+                if not dst.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    # Copy model files into writable cache
+                    if src.is_dir():
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    else:
+                        dst.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst / src.name)
+        except Exception as e:
+            logging.getLogger("neurose_vton.person.face").warning("Model seed failed: %s", e)
+        return pack, writable_root
+
     def compute(self, image_path: Path) -> Optional[FaceResult]:
         log = logging.getLogger("neurose_vton.person.face")
         if self._lib is None:
@@ -46,16 +77,9 @@ class FaceIDBackend:
         try:
             import numpy as np  # type: ignore
             from insightface.app import FaceAnalysis  # type: ignore
-            # Choose model pack name by available files
-            pack = "buffalo_l"
-            root_path = self.model_dir
-            if self.model_dir:
-                if (self.model_dir / "antelopev2").exists():
-                    pack = "antelopev2"
-                elif (self.model_dir / "unpacked" / "antelopev2").exists():
-                    pack = "antelopev2"
-                    root_path = self.model_dir / "unpacked"
-            app = FaceAnalysis(name=pack, root=str(root_path) if root_path else None)
+            # Prepare models under writable cache root to avoid read-only mounts
+            pack, writable_root = self._prepare_models()
+            app = FaceAnalysis(name=pack, root=str(writable_root))
             app.prepare(ctx_id=0 if self._has_cuda() else -1)
             img = _load_image(image_path)
             if img is None:
@@ -192,13 +216,8 @@ class ParsingBackend:
             shutil.copyfile(image_path, in_img)
 
             # Build command
-            gpu_arg = '0'
-            try:
-                import torch  # type: ignore
-                if not torch.cuda.is_available():
-                    gpu_arg = 'None'
-            except Exception:
-                gpu_arg = 'None'
+            # Run SCHP extractor on CPU to avoid requiring CUDA toolkit in container
+            gpu_arg = 'None'
 
             cmd = [
                 sys.executable,
@@ -284,8 +303,12 @@ class SmplxBackend:
         try:
             import torch  # type: ignore
             import smplx  # type: ignore
-            model_dir = None
-            # Prefer explicit model_dir if contains .npz
+            # Build a cache model directory with expected structure: <root>/smplx/SMPLX_NEUTRAL_2020.npz
+            cache_root = PATHS.runtime_cache / "smplx_models"
+            target_dir = cache_root / "smplx"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            # Locate source npz
+            src_npz = None
             candidates: List[Path] = []
             if self.model_dir:
                 candidates.append(self.model_dir)
@@ -293,14 +316,22 @@ class SmplxBackend:
             for d in candidates:
                 for name in ["SMPLX_NEUTRAL_2020.npz", "SMPLX_NEUTRAL.npz"]:
                     if (d / name).exists():
-                        model_dir = d
+                        src_npz = d / name
                         break
-                if model_dir:
+                if src_npz:
                     break
-            if model_dir is None:
+            if src_npz is None:
                 log.warning("SMPL-X neutral npz not found; skipping")
                 return None
-            model = smplx.create(model_path=str(model_dir), model_type='smplx', gender='neutral', use_pca=False)
+            # Copy into cache structure
+            dst_npz = target_dir / src_npz.name
+            if not dst_npz.exists():
+                shutil.copy2(src_npz, dst_npz)
+            # Some smplx versions expect SMPLX_NEUTRAL.npz specifically
+            neutral_alias = target_dir / "SMPLX_NEUTRAL.npz"
+            if not neutral_alias.exists():
+                shutil.copy2(dst_npz, neutral_alias)
+            model = smplx.create(model_path=str(cache_root), model_type='smplx', gender='neutral', use_pca=False)
             out = model()
             verts = out.vertices[0].detach().cpu().numpy()
             faces = model.faces

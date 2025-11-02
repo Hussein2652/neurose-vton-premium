@@ -26,7 +26,8 @@ person = [
   "opencv-python-headless>=4.8",
   "ultralytics>=8.0.0",
   "insightface>=0.7.3",
-  "onnxruntime-gpu>=1.16.0",
+  "onnxruntime>=1.16.0",
+  "timm>=0.9.7",
   "smplx>=0.1.28",
 ]
 dev = [
