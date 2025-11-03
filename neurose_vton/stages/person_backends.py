@@ -207,6 +207,15 @@ class ParsingBackend:
 
     def compute(self, image_path: Path) -> Optional[Path]:
         log = logging.getLogger("neurose_vton.person.parsing")
+        # Inline fast path toggle
+        try:
+            if os.environ.get("NEUROSE_SCHP_INLINE", "1") in {"1", "true", "True"}:
+                out = self._compute_inline(image_path)
+                if out is not None:
+                    return out
+        except Exception:
+            # Fall back to subprocess path on any inline error
+            pass
         try:
             # Locate SCHP repo and weights
             repo = None
@@ -312,6 +321,172 @@ class ParsingBackend:
         except Exception as e:
             log.exception("SCHP parsing exception: %s", e)
             return None
+
+    def _compute_inline(self, image_path: Path) -> Optional[Path]:
+        """Inline SCHP parsing on GPU/CPU without spawning a subprocess.
+        Loads model once and reuses it across requests. Saves a PNG next to trace.
+        """
+        log = logging.getLogger("neurose_vton.person.parsing")
+        # Resolve repo
+        repo_candidates: List[Path] = []
+        if self.model_dir:
+            repo_candidates += [self.model_dir / "Self-Correction-Human-Parsing-master", self.model_dir]
+        repo_candidates += [
+            Path("third_party/schp/Self-Correction-Human-Parsing-master").resolve(),
+            Path("manual_downloads/schp_downloads/Self-Correction-Human-Parsing-master").resolve(),
+        ]
+        repo = None
+        for c in repo_candidates:
+            if (c / "networks.py").exists() or (c / "networks" / "__init__.py").exists():
+                repo = c
+                break
+        if repo is None:
+            return None
+        # Resolve weight
+        weight = None
+        for p in [
+            Path("storage/models/schp_lip").resolve(),
+            Path("manual_downloads/schp_downloads").resolve(),
+            self.model_dir.resolve() if self.model_dir else None,
+        ]:
+            if not p:
+                continue
+            for cand in p.rglob("exp-schp-201908261155-lip.pth"):
+                weight = cand
+                break
+            if weight:
+                break
+        if weight is None or not weight.exists():
+            return None
+
+        # Lazy singleton model
+        model, input_size = _SchpInlineModel.get(repo, weight)
+        if model is None:
+            return None
+
+        # Load image via cv2 to match SCHP BGR preprocessing
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+        img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            return None
+        h, w = img_bgr.shape[:2]
+        # Compute center/scale like dataset
+        aspect_ratio = input_size[1] * 1.0 / input_size[0]
+        x, y, bw, bh = 0.0, 0.0, float(w - 1), float(h - 1)
+        cx, cy = x + bw * 0.5, y + bh * 0.5
+        if bw > aspect_ratio * bh:
+            bh = bw * 1.0 / aspect_ratio
+        elif bw < aspect_ratio * bh:
+            bw = bh * aspect_ratio
+        scale = np.array([bw, bh], dtype=np.float32)
+        center = np.array([cx, cy], dtype=np.float32)
+        # Affine warp to network input size
+        sys.path.insert(0, str(repo))
+        from utils.transforms import get_affine_transform, transform_logits  # type: ignore
+        trans = get_affine_transform(center, scale, 0, input_size)
+        inp = cv2.warpAffine(
+            img_bgr,
+            trans,
+            (int(input_size[1]), int(input_size[0])),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+        # To tensor (BGR order) and normalize with SCHP BGR means/stds
+        import torch  # type: ignore
+        arr = inp.astype(np.float32) / 255.0
+        mean = np.array([0.406, 0.456, 0.485], dtype=np.float32)
+        std = np.array([0.225, 0.224, 0.229], dtype=np.float32)
+        arr = (arr - mean) / std
+        chw = arr.transpose(2, 0, 1)  # CHW
+        x_t = torch.from_numpy(chw).unsqueeze(0).to(_SchpInlineModel.device())
+        if _SchpInlineModel.use_fp16():
+            x_t = x_t.half()
+
+        with torch.no_grad():
+            out = model(x_t)
+            # Extract logits tensor robustly
+            logits = None
+            if isinstance(out, (list, tuple)) and len(out) > 0:
+                last = out[0]
+                if isinstance(last, (list, tuple)) and len(last) > 0:
+                    logits = last[-1]
+                else:
+                    logits = last
+            elif isinstance(out, dict):
+                logits = out.get('out') or out.get('logits')
+            else:
+                logits = out
+            if isinstance(logits, (list, tuple)):
+                logits = logits[-1]
+            # logits shape: [B, C, H, W]
+            if isinstance(logits, torch.Tensor) and logits.dim() == 4:
+                logits = torch.nn.functional.interpolate(logits.float(), size=tuple(input_size.tolist()), mode='bilinear', align_corners=True)
+                logits_hw = logits[0].permute(1, 2, 0).cpu().numpy()  # HWC
+            else:
+                return None
+        # Map back to original resolution using SCHP transform
+        logits_resized = transform_logits(logits_hw, center, scale, w, h, input_size=input_size.tolist())
+        parsing = np.argmax(logits_resized, axis=2).astype(np.uint8)
+        # Save next to trace output (handled by caller)
+        # We return a temporary path under runtime_cache and the caller copies it into the trace dir
+        from tempfile import mkdtemp
+        tmpd = Path(mkdtemp())
+        out_png = tmpd / (image_path.stem + ".png")
+        from PIL import Image
+        Image.fromarray(parsing).save(out_png)
+        return out_png
+
+
+class _SchpInlineModel:
+    _cache: Dict[str, Any] = {}
+
+    @classmethod
+    def device(cls):
+        try:
+            import torch  # type: ignore
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        except Exception:
+            class _D:  # type: ignore
+                pass
+            return "cpu"
+
+    @classmethod
+    def use_fp16(cls) -> bool:
+        return os.environ.get("NEUROSE_SCHP_FP16", "1") in {"1", "true", "True"}
+
+    @classmethod
+    def get(cls, repo: Path, weight: Path):
+        key = f"{repo}::{weight}"
+        if key in cls._cache:
+            return cls._cache[key]
+        # Build model
+        sys.path.insert(0, str(repo))
+        try:
+            import torch  # type: ignore
+            import numpy as np  # type: ignore
+            import importlib
+            networks = importlib.import_module("networks")
+            model = networks.init_model('resnet101', num_classes=20, pretrained=None)  # LIP 20 classes
+            state = torch.load(str(weight), map_location="cpu").get('state_dict', {})
+            from collections import OrderedDict
+            new_state = OrderedDict()
+            for k, v in state.items():
+                name = k[7:] if k.startswith('module.') else k
+                new_state[name] = v
+            model.load_state_dict(new_state, strict=False)
+            dev = cls.device()
+            model.to(dev).eval()
+            if cls.use_fp16() and str(dev) != 'cpu':
+                model.half()
+            # Input size for LIP
+            input_size = np.asarray([473, 473], dtype=np.int32)
+            cls._cache[key] = (model, input_size)
+            return cls._cache[key]
+        except Exception as e:
+            logging.getLogger("neurose_vton.person.parsing").warning("Inline SCHP init failed: %s", e)
+            return (None, None)
 
 
 class DepthBackend:
@@ -434,6 +609,17 @@ class DepthBackend:
                                                config_mode='infer', pretrained_resource=f"local::{ckpt}")
                         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                         model.to(device).eval()
+                        # Ensure missing drop_path attributes are present across all submodules
+                        try:
+                            import torch.nn as nn  # type: ignore
+                            for mod in getattr(model, 'modules', lambda: [])():
+                                if not hasattr(mod, 'drop_path'):
+                                    try:
+                                        setattr(mod, 'drop_path', nn.Identity())
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                         # Forward below
                         img = Image.open(image_path).convert('RGB')
                         arr = np.asarray(img).astype('float32') / 255.0
@@ -520,6 +706,26 @@ class DepthBackend:
         # 4) Load checkpoint
         sd = torch.load(str(ckpt), map_location=device)
         state = sd.get("state_dict", sd.get("model", sd))
+        # Sanitize incoming state: keep only matching keys/shapes
+        try:
+            target = model.state_dict()
+            filtered = {}
+            dropped = 0
+            for k, v in state.items():
+                if k in target and hasattr(v, 'shape') and hasattr(target[k], 'shape') and tuple(v.shape) == tuple(target[k].shape):
+                    filtered[k] = v
+                else:
+                    dropped += 1
+            if dropped:
+                logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth state filtered: kept=%d dropped=%d", len(filtered), dropped)
+            state = filtered if filtered else state
+        except Exception:
+            pass
+        try:
+            import sys as _sys
+            _sys.setrecursionlimit(max(_sys.getrecursionlimit(), 10000))
+        except Exception:
+            pass
         try:
             model.load_state_dict(state, strict=False)
         except Exception as e:
@@ -535,7 +741,15 @@ class DepthBackend:
                             pass
             except Exception:
                 pass
-            model.load_state_dict(state, strict=False)
+            try:
+                model.load_state_dict(state, strict=False)
+            except Exception:
+                # Last resort: attempt loading without positional index tensors
+                try:
+                    state2 = {k: v for k, v in state.items() if 'relative_position_index' not in k}
+                    model.load_state_dict(state2, strict=False)
+                except Exception:
+                    raise
 
         # 5) Inference
         img = Image.open(image_path).convert('RGB')
