@@ -123,7 +123,7 @@ class PoseBackend:
     def __init__(self, model_dir: Optional[Path]) -> None:
         self.model_dir = model_dir
 
-    def compute(self, image_path: Path) -> Optional[Dict[str, Any]]:
+    def compute(self, image_path: Path, target_xy: Optional[List[float]] = None) -> Optional[Dict[str, Any]]:
         log = logging.getLogger("neurose_vton.person.pose")
         # Try ultralytics YOLOv8-pose first
         try:
@@ -144,13 +144,36 @@ class PoseBackend:
                 return None
             model = YOLO(weight)
             results = model(source=str(image_path), imgsz=640, device=0 if self._has_cuda() else "cpu")
-            # Convert first result to COCO17 list
+            # Choose the person whose bbox center is closest to target_xy (if provided), else the first
             coco17: List[List[float]] = []
-            for r in results:
-                if hasattr(r, "keypoints") and r.keypoints is not None:
-                    k = r.keypoints.xy[0].tolist()
+            try:
+                for r in results:
+                    if getattr(r, "keypoints", None) is None or getattr(r, "boxes", None) is None:
+                        continue
+                    k_all = r.keypoints.xy  # [N, 17, 2]
+                    b_all = r.boxes.xyxy   # [N, 4]
+                    n = int(getattr(k_all, 'shape', [0])[0]) if hasattr(k_all, 'shape') else 0
+                    if n == 0:
+                        continue
+                    sel = 0
+                    if target_xy is not None and len(target_xy) == 2:
+                        import torch  # type: ignore
+                        cx = (b_all[:, 0] + b_all[:, 2]) * 0.5
+                        cy = (b_all[:, 1] + b_all[:, 3]) * 0.5
+                        tx, ty = float(target_xy[0]), float(target_xy[1])
+                        d = (cx - tx) ** 2 + (cy - ty) ** 2
+                        sel = int(torch.argmin(d).item())
+                    # Extract COCO17 for selected idx
+                    k = k_all[sel].tolist()
                     coco17 = [[float(x), float(y)] for x, y in k]
                     break
+            except Exception:
+                # Fallback to first available keypoints tensor
+                for r in results:
+                    if hasattr(r, "keypoints") and r.keypoints is not None:
+                        k = r.keypoints.xy[0].tolist()
+                        coco17 = [[float(x), float(y)] for x, y in k]
+                        break
             log.info("Pose estimated with YOLOv8; points=%d", len(coco17))
             # Derive BODY_25 approximation
             def _mid(a: List[float], b: List[float]) -> List[float]:
@@ -375,6 +398,10 @@ class ParsingBackend:
         model, input_size = _SchpInlineModel.get(repo, weight)
         if model is None:
             return None
+        try:
+            log.info("SCHP inline using repo=%s weight=%s input=%sx%s", str(repo), str(weight), int(input_size[1]), int(input_size[0]))
+        except Exception:
+            pass
 
         # Load image via cv2 to match SCHP BGR preprocessing
         import cv2  # type: ignore
@@ -752,14 +779,19 @@ class DepthBackend:
         except Exception as e:
             logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth build failed: %s", e)
             raise
-        # Ensure any submodule has a drop_path attribute to avoid forward errors
+        # Ensure any submodule has a drop_path attribute to avoid forward errors.
+        # If instances disallow new attrs (e.g., __slots__), set on the class.
         try:
             import torch.nn as nn  # type: ignore
             for mod in getattr(model, 'modules', lambda: [])():
-                try:
-                    setattr(mod, 'drop_path', nn.Identity())
-                except Exception:
-                    pass
+                if not hasattr(mod, 'drop_path'):
+                    try:
+                        setattr(mod, 'drop_path', nn.Identity())
+                    except Exception:
+                        try:
+                            setattr(mod.__class__, 'drop_path', nn.Identity())
+                        except Exception:
+                            pass
         except Exception:
             pass
         # 4) Load checkpoint

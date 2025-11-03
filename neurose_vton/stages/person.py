@@ -170,7 +170,18 @@ f 1 2 3
             pose_body25_json = out_dir / "pose_body25.json"
             pose_backend = PoseBackend(model_dir=Path(resolved["openpose"]) if resolved["openpose"] else None)
             t0 = time.time()
-            pose_res = pose_backend.compute(image_path)
+            # If we have a face bbox, choose the YOLO person detection closest to its center
+            target_xy = None
+            try:
+                if isinstance(face_res, type(None)):
+                    target_xy = None
+                else:
+                    bb = getattr(face_res, 'bbox', None)
+                    if bb and len(bb) == 4:
+                        target_xy = [float((bb[0] + bb[2]) * 0.5), float((bb[1] + bb[3]) * 0.5)]
+            except Exception:
+                target_xy = None
+            pose_res = pose_backend.compute(image_path, target_xy=target_xy)
             t_pose = int((time.time() - t0) * 1000)
             if pose_res is None:
                 self._save_json(pose_json, {"keypoints": [], "format": "BODY_25", "note": "placeholder"})
