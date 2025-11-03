@@ -145,7 +145,7 @@ def ui() -> HTMLResponse:
             const p = traceUrl + '/person';
             html += '<div class=\"row\">';
             const imgs = [
-              'segmentation.png','hair_mask.png','arms_mask.png','hands_mask.png','depth.png','normals.png'
+              'seg_overlay.png','segmentation.png','hair_mask.png','arms_mask.png','hands_mask.png','depth.png','normals.png'
             ];
             for (const name of imgs) {
               html += '<div class=\"col\"><div class=\"muted\">'+name+'</div><img src=\"'+p+'/'+name+'\" onerror=\"this.style.display=\\'none\\'\" /></div>';

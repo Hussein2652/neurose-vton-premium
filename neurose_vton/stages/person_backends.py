@@ -213,9 +213,16 @@ class ParsingBackend:
                 out = self._compute_inline(image_path)
                 if out is not None:
                     return out
-        except Exception:
-            # Fall back to subprocess path on any inline error
-            pass
+                else:
+                    if os.environ.get("NEUROSE_SCHP_STRICT", "1") in {"1", "true", "True"}:
+                        log.warning("SCHP inline returned no result; STRICT enabled, skipping extractor fallback")
+                        return None
+                    log.warning("SCHP inline returned no result; falling back to extractor")
+        except Exception as e:
+            if os.environ.get("NEUROSE_SCHP_STRICT", "1") in {"1", "true", "True"}:
+                log.warning("SCHP inline failed: %s; STRICT enabled, skipping extractor fallback", e)
+                return None
+            log.warning("SCHP inline failed: %s; falling back to extractor", e)
         try:
             # Locate SCHP repo and weights
             repo = None
@@ -411,20 +418,27 @@ class ParsingBackend:
 
         with torch.no_grad():
             out = model(x_t)
-            # Extract logits tensor robustly
+            # Extract logits tensor robustly, matching simple_extractor: output[0][-1][0]
             logits = None
-            if isinstance(out, (list, tuple)) and len(out) > 0:
-                last = out[0]
-                if isinstance(last, (list, tuple)) and len(last) > 0:
-                    logits = last[-1]
+            try:
+                if isinstance(out, (list, tuple)) and len(out) > 0:
+                    o0 = out[0]
+                    if isinstance(o0, (list, tuple)) and len(o0) > 0:
+                        last = o0[-1]
+                        if isinstance(last, (list, tuple)) and len(last) > 0:
+                            logits = last[0]
+                        else:
+                            logits = last
+                    else:
+                        logits = o0
+                elif isinstance(out, dict):
+                    logits = out.get('out') or out.get('logits') or out.get('result') or next(iter(out.values()))
                 else:
-                    logits = last
-            elif isinstance(out, dict):
-                logits = out.get('out') or out.get('logits')
-            else:
-                logits = out
-            if isinstance(logits, (list, tuple)):
-                logits = logits[-1]
+                    logits = out
+                if isinstance(logits, (list, tuple)) and len(logits) > 0:
+                    logits = logits[0]
+            except Exception:
+                logits = None
             # logits shape: [B, C, H, W]
             if isinstance(logits, torch.Tensor) and logits.dim() == 4:
                 logits = torch.nn.functional.interpolate(logits.float(), size=tuple(input_size.tolist()), mode='bilinear', align_corners=True)
@@ -434,13 +448,26 @@ class ParsingBackend:
         # Map back to original resolution using SCHP transform
         logits_resized = transform_logits(logits_hw, center, scale, w, h, input_size=input_size.tolist())
         parsing = np.argmax(logits_resized, axis=2).astype(np.uint8)
-        # Save next to trace output (handled by caller)
-        # We return a temporary path under runtime_cache and the caller copies it into the trace dir
+        # Save next to trace output (handled by caller) with color palette like SCHP
         from tempfile import mkdtemp
         tmpd = Path(mkdtemp())
         out_png = tmpd / (image_path.stem + ".png")
         from PIL import Image
-        Image.fromarray(parsing).save(out_png)
+        # Build palette (same as SCHP get_palette)
+        num_classes = 20
+        palette = [0] * (num_classes * 3)
+        for j in range(num_classes):
+            lab = j
+            i = 0
+            while lab:
+                palette[j * 3 + 0] |= (((lab >> 0) & 1) << (7 - i))
+                palette[j * 3 + 1] |= (((lab >> 1) & 1) << (7 - i))
+                palette[j * 3 + 2] |= (((lab >> 2) & 1) << (7 - i))
+                i += 1
+                lab >>= 3
+        img_p = Image.fromarray(parsing, mode='P')
+        img_p.putpalette(palette)
+        img_p.save(out_png)
         return out_png
 
 
@@ -574,6 +601,35 @@ class DepthBackend:
         import torch  # type: ignore
         import numpy as np  # type: ignore
         from PIL import Image
+        # Global patch: ensure timm Blocks have a drop_path attribute during forward
+        try:
+            import torch.nn as nn  # type: ignore
+            try:
+                from timm.models.vision_transformer import Block as _ViTBlock  # type: ignore
+                if not hasattr(_ViTBlock, "_nvton_patched"):
+                    _old_forward = _ViTBlock.forward
+                    def _safe_forward(self, *args, **kwargs):
+                        if not hasattr(self, 'drop_path') or self.drop_path is None:
+                            setattr(self, 'drop_path', nn.Identity())
+                        return _old_forward(self, *args, **kwargs)
+                    _ViTBlock.forward = _safe_forward  # type: ignore
+                    _ViTBlock._nvton_patched = True  # type: ignore
+            except Exception:
+                pass
+            try:
+                from timm.models.swin_transformer import SwinTransformerBlock as _SwinBlock  # type: ignore
+                if not hasattr(_SwinBlock, "_nvton_patched"):
+                    _old_forward2 = _SwinBlock.forward
+                    def _safe_forward2(self, *args, **kwargs):
+                        if not hasattr(self, 'drop_path') or self.drop_path is None:
+                            setattr(self, 'drop_path', nn.Identity())
+                        return _old_forward2(self, *args, **kwargs)
+                    _SwinBlock.forward = _safe_forward2  # type: ignore
+                    _SwinBlock._nvton_patched = True  # type: ignore
+            except Exception:
+                pass
+        except Exception:
+            pass
         # 1) Resolve checkpoint
         ckpt: Optional[Path] = None
         if self.model_dir:
@@ -618,11 +674,10 @@ class DepthBackend:
                         try:
                             import torch.nn as nn  # type: ignore
                             for mod in getattr(model, 'modules', lambda: [])():
-                                if not hasattr(mod, 'drop_path'):
-                                    try:
-                                        setattr(mod, 'drop_path', nn.Identity())
-                                    except Exception:
-                                        pass
+                                try:
+                                    setattr(mod, 'drop_path', nn.Identity())
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                         # Forward below
@@ -697,15 +752,14 @@ class DepthBackend:
         except Exception as e:
             logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth build failed: %s", e)
             raise
-        # Ensure any timm Blocks have a drop_path attribute to avoid forward errors
+        # Ensure any submodule has a drop_path attribute to avoid forward errors
         try:
             import torch.nn as nn  # type: ignore
             for mod in getattr(model, 'modules', lambda: [])():
-                if not hasattr(mod, 'drop_path'):
-                    try:
-                        setattr(mod, 'drop_path', nn.Identity())
-                    except Exception:
-                        pass
+                try:
+                    setattr(mod, 'drop_path', nn.Identity())
+                except Exception:
+                    pass
         except Exception:
             pass
         # 4) Load checkpoint

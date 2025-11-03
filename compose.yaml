@@ -20,7 +20,9 @@ services:
       NEUROSE_SKIP_ZOEDEPTH: "${NEUROSE_SKIP_ZOEDEPTH:-0}"
       NEUROSE_ZOEDEPTH_REPO: "/app/runtime_cache/Person Analysis Models/zoedepth_repo/ZoeDepth-main"
       NEUROSE_SCHP_INLINE: "${NEUROSE_SCHP_INLINE:-1}"
-      NEUROSE_SCHP_FP16: "${NEUROSE_SCHP_FP16:-1}"
+      NEUROSE_SCHP_FP16: "${NEUROSE_SCHP_FP16:-0}"
+      NEUROSE_SCHP_STRICT: "${NEUROSE_SCHP_STRICT:-1}"
+      TORCH_CUDA_ARCH_LIST: "${TORCH_CUDA_ARCH_LIST:-8.6}"
     volumes:
       - ./storage:/app/storage:ro
       - ./manual_downloads:/app/manual_downloads:ro
