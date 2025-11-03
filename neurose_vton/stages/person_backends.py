@@ -246,6 +246,11 @@ class ParsingBackend:
             ]
             if self.model_dir:
                 weight_candidates += [self.model_dir / "exp-schp-201908261155-lip.pth"]
+                try:
+                    for cand in self.model_dir.rglob("exp-schp-201908261155-lip.pth"):
+                        weight_candidates.append(cand)
+                except Exception:
+                    pass
             for p in weight_candidates:
                 if p.exists():
                     weight = p
