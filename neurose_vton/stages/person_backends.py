@@ -440,11 +440,24 @@ class ParsingBackend:
         arr = (arr - mean) / std
         chw = arr.transpose(2, 0, 1)  # CHW
         x_t = torch.from_numpy(chw).unsqueeze(0).to(_SchpInlineModel.device())
-        if _SchpInlineModel.use_fp16():
+        use_fp16 = _SchpInlineModel.use_fp16() and str(_SchpInlineModel.device()) != 'cpu'
+        if use_fp16:
             x_t = x_t.half()
 
         with torch.no_grad():
-            out = model(x_t)
+            try:
+                out = model(x_t)
+            except RuntimeError as e:
+                # Common on older SCHP when some ops/layers don't support fp16
+                if ("Half" in str(e) or "float16" in str(e)) and use_fp16:
+                    log.warning("SCHP inline fp16 failed; retrying fp32")
+                    try:
+                        model.float()
+                    except Exception:
+                        pass
+                    out = model(x_t.float())
+                else:
+                    raise
             # Extract logits tensor robustly, matching simple_extractor: output[0][-1][0]
             logits = None
             try:
@@ -628,35 +641,49 @@ class DepthBackend:
         import torch  # type: ignore
         import numpy as np  # type: ignore
         from PIL import Image
-        # Global patch: ensure timm Blocks have a drop_path attribute during forward
-        try:
-            import torch.nn as nn  # type: ignore
+        # Helper to disable stochastic depth / droppath regardless of timm version
+        import torch.nn as nn  # type: ignore
+        def _disable_droppath_config(conf_obj: Any) -> None:
             try:
-                from timm.models.vision_transformer import Block as _ViTBlock  # type: ignore
-                if not hasattr(_ViTBlock, "_nvton_patched"):
-                    _old_forward = _ViTBlock.forward
-                    def _safe_forward(self, *args, **kwargs):
-                        if not hasattr(self, 'drop_path') or self.drop_path is None:
-                            setattr(self, 'drop_path', nn.Identity())
-                        return _old_forward(self, *args, **kwargs)
-                    _ViTBlock.forward = _safe_forward  # type: ignore
-                    _ViTBlock._nvton_patched = True  # type: ignore
+                # common keys used by zoedepth variants
+                for k in ("drop_path_rate", "stochastic_depth"):
+                    if hasattr(conf_obj, k):
+                        try:
+                            setattr(conf_obj, k, 0.0)
+                        except Exception:
+                            pass
+                # nested dicts
+                for key in ("zoedepth", "zoedepth_nk"):
+                    d = getattr(conf_obj, key, None)
+                    if isinstance(d, dict):
+                        d["drop_path_rate"] = 0.0
             except Exception:
                 pass
+        def _replace_droppath_modules(m: nn.Module) -> None:
             try:
-                from timm.models.swin_transformer import SwinTransformerBlock as _SwinBlock  # type: ignore
-                if not hasattr(_SwinBlock, "_nvton_patched"):
-                    _old_forward2 = _SwinBlock.forward
-                    def _safe_forward2(self, *args, **kwargs):
-                        if not hasattr(self, 'drop_path') or self.drop_path is None:
-                            setattr(self, 'drop_path', nn.Identity())
-                        return _old_forward2(self, *args, **kwargs)
-                    _SwinBlock.forward = _safe_forward2  # type: ignore
-                    _SwinBlock._nvton_patched = True  # type: ignore
+                try:
+                    from timm.models.layers import DropPath as DP  # type: ignore
+                except Exception:
+                    try:
+                        from timm.layers import DropPath as DP  # type: ignore
+                    except Exception:
+                        DP = None  # type: ignore
+                for name, child in list(m.named_children()):
+                    try:
+                        if hasattr(child, 'drop_path') and child.drop_path is not None:
+                            setattr(child, 'drop_path', nn.Identity())
+                    except Exception:
+                        pass
+                    if DP is not None:
+                        try:
+                            if isinstance(child, DP):
+                                setattr(m, name, nn.Identity())
+                                child = getattr(m, name)
+                        except Exception:
+                            pass
+                    _replace_droppath_modules(child)
             except Exception:
                 pass
-        except Exception:
-            pass
         # 1) Resolve checkpoint
         ckpt: Optional[Path] = None
         if self.model_dir:
@@ -774,26 +801,15 @@ class DepthBackend:
                 conf.zoedepth_nk["pretrained_resource"] = None
         except Exception:
             pass
+        # Try to disable droppath in config before build
+        _disable_droppath_config(conf)
         try:
             model = build_model(conf).to(device).eval()
         except Exception as e:
             logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth build failed: %s", e)
             raise
-        # Ensure any submodule has a drop_path attribute to avoid forward errors.
-        # If instances disallow new attrs (e.g., __slots__), set on the class.
-        try:
-            import torch.nn as nn  # type: ignore
-            for mod in getattr(model, 'modules', lambda: [])():
-                if not hasattr(mod, 'drop_path'):
-                    try:
-                        setattr(mod, 'drop_path', nn.Identity())
-                    except Exception:
-                        try:
-                            setattr(mod.__class__, 'drop_path', nn.Identity())
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+        # Disable droppath modules/attrs post-build
+        _replace_droppath_modules(model)
         # 4) Load checkpoint
         sd = torch.load(str(ckpt), map_location=device)
         state = sd.get("state_dict", sd.get("model", sd))
@@ -859,8 +875,32 @@ class DepthBackend:
                 depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
                 depth = depth.squeeze().detach().cpu().float().numpy()
         except Exception as e:
-            logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth forward failed: %s", e)
-            raise
+            log = logging.getLogger("neurose_vton.person.depth")
+            log.warning("ZoeDepth forward failed: %s", e)
+            # Retry once after aggressively setting drop_path on all modules/classes
+            try:
+                import torch.nn as nn  # type: ignore
+                for mod in getattr(model, 'modules', lambda: [])():
+                    if not hasattr(mod, 'drop_path'):
+                        try:
+                            setattr(mod, 'drop_path', nn.Identity())
+                        except Exception:
+                            try:
+                                setattr(mod.__class__, 'drop_path', nn.Identity())
+                            except Exception:
+                                pass
+                with torch.inference_mode():
+                    out = model(x)
+                    if isinstance(out, (list, tuple)):
+                        depth = out[0]
+                    elif isinstance(out, dict):
+                        depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                    else:
+                        depth = out
+                    depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
+                    depth = depth.squeeze().detach().cpu().float().numpy()
+            except Exception:
+                raise
         # 6) Normalize and normals
         p = depth
         pmin, pmax = float(p.min()), float(p.max())
