@@ -562,6 +562,7 @@ class _SchpInlineModel:
 
 
 class DepthBackend:
+    _disabled: bool = False  # latch to avoid repeated ZoeDepth attempts after a hard failure
     def __init__(self, model_dir: Optional[Path]) -> None:
         self.model_dir = model_dir
 
@@ -570,13 +571,14 @@ class DepthBackend:
         # 1) Try ZoeDepth with local checkpoint; strictly offline (no runtime installs)
         # Allow user to skip via env for speed/stability
         skip_zoe = os.environ.get("NEUROSE_SKIP_ZOEDEPTH", "0") in {"1", "true", "True"}
-        if not skip_zoe:
+        if not skip_zoe and not DepthBackend._disabled:
             try:
                 res = self._compute_zoedepth(image_path)
                 if res is not None:
                     return res
             except Exception as e:
                 log.warning("ZoeDepth failed (%s); falling back to MiDaS", e)
+                DepthBackend._disabled = True
         else:
             log.info("Skipping ZoeDepth due to NEUROSE_SKIP_ZOEDEPTH")
 
