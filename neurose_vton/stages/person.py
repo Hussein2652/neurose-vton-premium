@@ -295,16 +295,20 @@ f 1 2 3
             s.update(_cuda_stats())
             status_map["smplx"] = s
 
-            # Lighting SH attempt
+            # Lighting SH estimation from normals + RGB
             light_json = out_dir / "light_sh.json"
             light_backend = LightingBackend()
             t0 = time.time()
-            light_res = light_backend.compute(image_path) or {"sh9": [0.0] * 9}
+            light_res = light_backend.compute(image_path, normals_png if normals_png.exists() else None, seg_png if seg_png.exists() else None)
             t_light = int((time.time() - t0) * 1000)
-            self._save_json(light_json, light_res)
-            log.info("Lighting step: ok | SH saved")
-            artifacts["light_sh"] = light_json
-            s = {"ok": True, "backend": "sh-relight", "device": "cpu", "ms": t_light}
+            if light_res is not None:
+                self._save_json(light_json, light_res)
+                log.info("Lighting step: ok | SH saved")
+                artifacts["light_sh"] = light_json
+                s = {"ok": True, "backend": "sh-relight", "device": "cpu", "ms": t_light}
+            else:
+                log.warning("Lighting step: no output")
+                s = {"ok": False, "backend": "sh-relight", "device": "cpu", "ms": t_light}
             status_map["lighting"] = s
 
             # Models resolution snapshot

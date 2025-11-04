@@ -1103,6 +1103,98 @@ class SmplxBackend:
 
 
 class LightingBackend:
-    def compute(self, image_path: Path) -> Optional[Dict[str, Any]]:
-        # Simple placeholder: return zeros; real impl would estimate SH from normals/depth/face
-        return {"sh9": [0.0] * 9}
+    def compute(
+        self,
+        image_path: Path,
+        normals_path: Optional[Path] = None,
+        seg_path: Optional[Path] = None,
+        order: int = 2,
+    ) -> Optional[Dict[str, Any]]:
+        """Estimate low-order spherical harmonics lighting from image and normals.
+
+        - Computes real SH (up to order 2 => 9 coeffs) per RGB channel.
+        - Uses per-pixel normals (xyz in [-1,1]) and image radiance (RGB in [0,1]).
+        - Optionally masks to person region via segmentation labels (exclude background=0).
+        """
+        try:
+            import numpy as np  # type: ignore
+            from PIL import Image
+        except Exception:
+            return None
+
+        if normals_path is None or not Path(normals_path).exists():
+            return None
+        try:
+            img = Image.open(image_path).convert("RGB")
+            I = np.asarray(img).astype(np.float32) / 255.0  # HxWx3
+            n_img = Image.open(normals_path).convert("RGB")
+            N = np.asarray(n_img).astype(np.float32) / 255.0  # HxWx3 in [0,1]
+            # Map to [-1,1], renormalize
+            n = (N * 2.0 - 1.0).reshape(-1, 3)
+            n_norm = np.linalg.norm(n, axis=1, keepdims=True) + 1e-8
+            n = n / n_norm
+            H, W = I.shape[:2]
+            I_flat = I.reshape(-1, 3)
+            # Optional mask from segmentation: include non-background labels
+            mask = np.ones((H * W,), dtype=bool)
+            if seg_path is not None and Path(seg_path).exists():
+                try:
+                    seg = Image.open(seg_path)
+                    seg_idx = np.asarray(seg)
+                    # background label assumed 0 in LIP; keep others
+                    mask = (seg_idx.reshape(-1) != 0)
+                except Exception:
+                    pass
+            # Also remove invalid normals (nz ~ 0)
+            mask = mask & np.isfinite(n).all(axis=1)
+            if not np.any(mask):
+                return None
+            n = n[mask]
+            I_sel = I_flat[mask]
+
+            # Build SH basis up to order 2 (9 terms) with real SH constants
+            x = n[:, 0]
+            y = n[:, 1]
+            z = n[:, 2]
+            H0 = np.full_like(x, 0.282095)
+            H1 = 0.488603 * y
+            H2 = 0.488603 * z
+            H3 = 0.488603 * x
+            H4 = 1.092548 * x * y
+            H5 = 1.092548 * y * z
+            H6 = 0.315392 * (3.0 * z * z - 1.0)
+            H7 = 1.092548 * x * z
+            H8 = 0.546274 * (x * x - y * y)
+            Hmat = np.stack([H0, H1, H2, H3, H4, H5, H6, H7, H8], axis=1)  # (N,9)
+
+            # Regularized least squares per channel: c = (H^T H + λI)^{-1} H^T I
+            lam = 1e-4
+            HT = Hmat.T
+            A = HT @ Hmat + lam * np.eye(Hmat.shape[1], dtype=np.float32)
+            B_r = HT @ I_sel[:, 0]
+            B_g = HT @ I_sel[:, 1]
+            B_b = HT @ I_sel[:, 2]
+            try:
+                c_r = np.linalg.solve(A, B_r)
+                c_g = np.linalg.solve(A, B_g)
+                c_b = np.linalg.solve(A, B_b)
+            except np.linalg.LinAlgError:
+                c_r = np.linalg.lstsq(A, B_r, rcond=None)[0]
+                c_g = np.linalg.lstsq(A, B_g, rcond=None)[0]
+                c_b = np.linalg.lstsq(A, B_b, rcond=None)[0]
+
+            coeffs = {
+                "r": [float(x) for x in c_r.tolist()],
+                "g": [float(x) for x in c_g.tolist()],
+                "b": [float(x) for x in c_b.tolist()],
+            }
+            ambient = float(I_sel.mean())
+            return {
+                "sh_order": int(order),
+                "coeffs": coeffs,
+                "ambient": ambient,
+                "pixels": int(mask.sum()),
+                "source": "midas_normals+rgb",
+            }
+        except Exception:
+            return None
