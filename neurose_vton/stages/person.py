@@ -230,17 +230,17 @@ f 1 2 3
                     shutil.copyfile(seg_path, seg_png)
                     log.info("Parsing step: ok | segmentation saved")
                 except Exception:
-                    self._save_blank_png(seg_png, 64, 64, 1)
-                    log.warning("Parsing step: copy failed; fallback")
+                    log.warning("Parsing step: copy failed; skipping")
             else:
-                self._save_blank_png(seg_png, 64, 64, 1)
-                log.warning("Parsing step: fallback (no output)")
+                log.warning("Parsing step: no output")
             artifacts["segmentation"] = seg_png
             # Derive occluder masks from segmentation if possible
-            self._save_occluder_masks(seg_png, out_dir)
+            if seg_png.exists():
+                self._save_occluder_masks(seg_png, out_dir)
             # Save overlay
-            self._save_seg_overlay(image_path, seg_png, out_dir / "seg_overlay.png")
-            log.info("Parsing step: occluder masks saved")
+            if seg_png.exists():
+                self._save_seg_overlay(image_path, seg_png, out_dir / "seg_overlay.png")
+                log.info("Parsing step: occluder masks saved")
             s = {"ok": bool(seg_path and seg_path.exists()), "backend": "schp", "device": _dev(), "ms": t_pars}
             s.update(_cuda_stats())
             status_map["parsing"] = s
@@ -260,13 +260,9 @@ f 1 2 3
                     Image.fromarray(depth_res["normals"]).save(normals_png)
                     log.info("Depth step: ok | depth+normals saved")
                 except Exception:
-                    self._save_blank_png(depth_png, 64, 64, 1)
-                    self._save_blank_png(normals_png, 64, 64, 3)
-                    log.warning("Depth step: write failed; fallback")
+                    log.warning("Depth step: write failed; skipping")
             else:
-                self._save_blank_png(depth_png, 64, 64, 1)
-                self._save_blank_png(normals_png, 64, 64, 3)
-                log.warning("Depth step: fallback (no output)")
+                log.warning("Depth step: no output")
             artifacts["depth"] = depth_png
             artifacts["normals"] = normals_png
             bd = "midas"
@@ -291,11 +287,9 @@ f 1 2 3
                     shutil.copyfile(smplx_obj, mesh_obj)
                     log.info("SMPL-X step: ok | mesh saved")
                 except Exception:
-                    self._save_placeholder_mesh(mesh_obj)
-                    log.warning("SMPL-X step: copy failed; fallback")
+                    log.warning("SMPL-X step: copy failed; skipping")
             else:
-                self._save_placeholder_mesh(mesh_obj)
-                log.warning("SMPL-X step: fallback (no mesh)")
+                log.warning("SMPL-X step: no mesh")
             artifacts["body_mesh"] = mesh_obj
             s = {"ok": bool(smplx_obj and smplx_obj.exists()), "backend": "smplx", "device": _dev(), "ms": t_smplx}
             s.update(_cuda_stats())

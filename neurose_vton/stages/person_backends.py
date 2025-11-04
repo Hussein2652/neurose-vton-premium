@@ -594,19 +594,8 @@ class DepthBackend:
 
     def compute(self, image_path: Path) -> Optional[Any]:
         log = logging.getLogger("neurose_vton.person.depth")
-        # 1) Try ZoeDepth with local checkpoint; strictly offline (no runtime installs)
-        # Allow user to skip via env for speed/stability
-        skip_zoe = os.environ.get("NEUROSE_SKIP_ZOEDEPTH", "0") in {"1", "true", "True"}
-        if not skip_zoe and not DepthBackend._disabled:
-            try:
-                res = self._compute_zoedepth(image_path)
-                if res is not None:
-                    return res
-            except Exception as e:
-                log.warning("ZoeDepth failed (%s); falling back to MiDaS", e)
-                DepthBackend._disabled = True
-        else:
-            log.info("Skipping ZoeDepth due to NEUROSE_SKIP_ZOEDEPTH")
+        # ZoeDepth disabled: use MiDaS only for stability and determinism
+        DepthBackend._disabled = True
 
         # 2) Fallback: MiDaS via torch.hub (cached)
         try:

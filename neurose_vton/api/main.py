@@ -134,7 +134,6 @@ def ui() -> HTMLResponse:
             <select name=\"depth_provider\">
               <option value=\"\">auto (env)</option>
               <option value=\"midas\">MiDaS</option>
-              <option value=\"zoe\">ZoeDepth</option>
             </select>
           </div>
           <div class=\"col\">
@@ -245,10 +244,10 @@ async def tryon_fast(
     garment_image: UploadFile = File(...),
     seed: Optional[int] = Form(None),
     return_intermediates: bool = Form(False),
-    depth_provider: Optional[str] = Form(None),  # 'midas' | 'zoe'
+    depth_provider: Optional[str] = Form(None),  # 'midas'
     midas_variant: Optional[str] = Form(None),   # e.g., 'DPT_BEiT_L_384'
     schp_tta_scales: Optional[str] = Form(None), # e.g., '1.0,0.75,1.25'
-    schp_fp16: Optional[int] = Form(None),       # 0/1
+    schp_fp16: Optional[str] = Form(None),       # 'on' | '1' | '0'
 ) -> JSONResponse:
     tmp = PATHS.runtime_cache / "uploads"
     p_path = _persist_upload(tmp, person_image)
@@ -257,16 +256,15 @@ async def tryon_fast(
     # Per-request env overrides
     overrides: dict[str, str] = {}
     if depth_provider:
-        if depth_provider.lower() == 'midas':
-            overrides['NEUROSE_SKIP_ZOEDEPTH'] = '1'
-        elif depth_provider.lower() == 'zoe':
-            overrides['NEUROSE_SKIP_ZOEDEPTH'] = '0'
+        # Only MiDaS is supported now
+        overrides['NEUROSE_SKIP_ZOEDEPTH'] = '1'
     if midas_variant:
         overrides['NEUROSE_MIDAS_VARIANT'] = midas_variant
     if schp_tta_scales:
         overrides['NEUROSE_SCHP_TTA_SCALES'] = schp_tta_scales
     if schp_fp16 is not None:
-        overrides['NEUROSE_SCHP_FP16'] = '1' if int(schp_fp16) != 0 else '0'
+        val = str(schp_fp16).lower()
+        overrides['NEUROSE_SCHP_FP16'] = '1' if val in {'1', 'true', 'on', 'yes'} else '0'
 
     prev: dict[str, Optional[str]] = {k: os.environ.get(k) for k in overrides}
     try:
@@ -298,7 +296,7 @@ async def tryon_premium(
     depth_provider: Optional[str] = Form(None),
     midas_variant: Optional[str] = Form(None),
     schp_tta_scales: Optional[str] = Form(None),
-    schp_fp16: Optional[int] = Form(None),
+    schp_fp16: Optional[str] = Form(None),
 ) -> JSONResponse:
     tmp = PATHS.runtime_cache / "uploads"
     p_path = _persist_upload(tmp, person_image)
@@ -306,16 +304,14 @@ async def tryon_premium(
 
     overrides: dict[str, str] = {}
     if depth_provider:
-        if depth_provider.lower() == 'midas':
-            overrides['NEUROSE_SKIP_ZOEDEPTH'] = '1'
-        elif depth_provider.lower() == 'zoe':
-            overrides['NEUROSE_SKIP_ZOEDEPTH'] = '0'
+        overrides['NEUROSE_SKIP_ZOEDEPTH'] = '1'
     if midas_variant:
         overrides['NEUROSE_MIDAS_VARIANT'] = midas_variant
     if schp_tta_scales:
         overrides['NEUROSE_SCHP_TTA_SCALES'] = schp_tta_scales
     if schp_fp16 is not None:
-        overrides['NEUROSE_SCHP_FP16'] = '1' if int(schp_fp16) != 0 else '0'
+        val = str(schp_fp16).lower()
+        overrides['NEUROSE_SCHP_FP16'] = '1' if val in {'1', 'true', 'on', 'yes'} else '0'
 
     prev: dict[str, Optional[str]] = {k: os.environ.get(k) for k in overrides}
     try:
