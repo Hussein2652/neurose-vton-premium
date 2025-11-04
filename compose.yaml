@@ -30,6 +30,8 @@ services:
       CUBLAS_WORKSPACE_CONFIG: "${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
       CUDA_HOME: "${CUDA_HOME:-/usr/local/cuda}"
       PYTHONWARNINGS: "${PYTHONWARNINGS}"
+      XDG_CONFIG_HOME: "/app/runtime_cache/.config"
+      XDG_CACHE_HOME: "/app/runtime_cache/.cache"
     volumes:
       - ./storage:/app/storage:ro
       - ./manual_downloads:/app/manual_downloads:ro

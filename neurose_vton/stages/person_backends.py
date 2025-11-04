@@ -480,11 +480,48 @@ class ParsingBackend:
             except Exception:
                 logits = None
             # logits shape: [B, C, H, W]
-            if isinstance(logits, torch.Tensor) and logits.dim() == 4:
-                logits = torch.nn.functional.interpolate(logits.float(), size=tuple(input_size.tolist()), mode='bilinear', align_corners=True)
-                logits_hw = logits[0].permute(1, 2, 0).cpu().numpy()  # HWC
-            else:
+            if not (isinstance(logits, torch.Tensor) and logits.dim() == 4):
                 return None
+            # Normalize to fixed input size
+            logits = torch.nn.functional.interpolate(logits.float(), size=tuple(input_size.tolist()), mode='bilinear', align_corners=True)
+            logits_acc = logits
+            # Optional TTA: horizontal flip
+            try:
+                if os.environ.get("NEUROSE_SCHP_TTA_FLIP", "1") in {"1", "true", "True"}:
+                    x_flip = torch.flip(x_t, dims=[3])
+                    out_f = model(x_flip if not use_fp16 else x_flip.half())
+                    # get logits like above
+                    lf = None
+                    if isinstance(out_f, (list, tuple)) and len(out_f) > 0:
+                        o0 = out_f[0]
+                        if isinstance(o0, (list, tuple)) and len(o0) > 0:
+                            last = o0[-1]
+                            lf = last[0] if isinstance(last, (list, tuple)) and len(last) > 0 else last
+                        else:
+                            lf = o0
+                    elif isinstance(out_f, dict):
+                        lf = out_f.get('out') or out_f.get('logits') or out_f.get('result') or next(iter(out_f.values()))
+                    else:
+                        lf = out_f
+                    if isinstance(lf, (list, tuple)) and len(lf) > 0:
+                        lf = lf[0]
+                    if isinstance(lf, torch.Tensor) and lf.dim() == 4:
+                        lf = torch.nn.functional.interpolate(lf.float(), size=tuple(input_size.tolist()), mode='bilinear', align_corners=True)
+                        # Unflip logits spatially
+                        lf = torch.flip(lf, dims=[3])
+                        # Swap left/right channels for LIP indices
+                        # Indices: 14<->15 (arms), 16<->17 (legs), 18<->19 (shoes)
+                        idx = list(range(20))
+                        idx[14], idx[15] = idx[15], idx[14]
+                        idx[16], idx[17] = idx[17], idx[16]
+                        idx[18], idx[19] = idx[19], idx[18]
+                        import torch as _t
+                        idx_t = _t.tensor(idx, dtype=_t.long, device=lf.device)
+                        lf = lf[:, idx_t, :, :]
+                        logits_acc = (logits_acc + lf) * 0.5
+            except Exception:
+                pass
+            logits_hw = logits_acc[0].permute(1, 2, 0).cpu().numpy()  # HWC
         # Map back to original resolution using SCHP transform
         logits_resized = transform_logits(logits_hw, center, scale, w, h, input_size=input_size.tolist())
         parsing = np.argmax(logits_resized, axis=2).astype(np.uint8)
@@ -736,22 +773,45 @@ class DepthBackend:
                                     pass
                         except Exception:
                             pass
-                        # Forward below
+                        # Inference per README: prefer model.infer_pil / infer
                         img = Image.open(image_path).convert('RGB')
-                        arr = np.asarray(img).astype('float32') / 255.0
-                        H, W = arr.shape[:2]
-                        x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
-                        with torch.inference_mode():
-                            out = model(x)
-                            if isinstance(out, (list, tuple)):
-                                depth = out[0]
-                            elif isinstance(out, dict):
-                                depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                        try:
+                            if hasattr(model, 'infer_pil'):
+                                depth_np = model.infer_pil(img)
+                            elif hasattr(model, 'infer'):
+                                from zoedepth.utils.misc import pil_to_batched_tensor  # type: ignore
+                                X = pil_to_batched_tensor(img).to(device)
+                                depth_t = model.infer(X)
+                                depth_np = depth_t.squeeze().detach().cpu().float().numpy()
                             else:
-                                depth = out
-                            depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
-                            depth = depth.squeeze().detach().cpu().float().numpy()
-                        p = depth
+                                # raw forward as last resort
+                                arr = np.asarray(img).astype('float32') / 255.0
+                                H, W = arr.shape[:2]
+                                x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
+                                with torch.inference_mode():
+                                    out = model(x)
+                                    if isinstance(out, (list, tuple)):
+                                        depth = out[0]
+                                    elif isinstance(out, dict):
+                                        depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                                    else:
+                                        depth = out
+                                    depth_np = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False).squeeze().detach().cpu().float().numpy()
+                        except Exception:
+                            # fallback to raw forward
+                            arr = np.asarray(img).astype('float32') / 255.0
+                            H, W = arr.shape[:2]
+                            x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
+                            with torch.inference_mode():
+                                out = model(x)
+                                if isinstance(out, (list, tuple)):
+                                    depth = out[0]
+                                elif isinstance(out, dict):
+                                    depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                                else:
+                                    depth = out
+                                depth_np = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False).squeeze().detach().cpu().float().numpy()
+                        p = depth_np
                         pmin, pmax = float(p.min()), float(p.max())
                         p = (p - pmin) / (pmax - pmin + 1e-8)
                         depth_u8 = (p * 255.0).astype(np.uint8)
@@ -788,19 +848,17 @@ class DepthBackend:
             from zoedepth.utils.config import get_config as _gc  # type: ignore
             build_model, zget_config = _bm, _gc
 
-        # 3) Build config and model without any pretrained URL
+        # 3) Build config and model using local checkpoint (no network)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         conf = zget_config(variant, "infer")
-        for key in ("pretrained_resource", "pretrained_model", "pretrained_resource_model"):
-            try:
-                setattr(conf, key, None)
-            except Exception:
-                pass
+        local_spec = f"local::{ckpt}"
         try:
+            if hasattr(conf, "pretrained_resource"):
+                setattr(conf, "pretrained_resource", local_spec)
             if hasattr(conf, "zoedepth") and isinstance(conf.zoedepth, dict):
-                conf.zoedepth["pretrained_resource"] = None
+                conf.zoedepth["pretrained_resource"] = local_spec
             if hasattr(conf, "zoedepth_nk") and isinstance(conf.zoedepth_nk, dict):
-                conf.zoedepth_nk["pretrained_resource"] = None
+                conf.zoedepth_nk["pretrained_resource"] = local_spec
         except Exception:
             pass
         # Try to disable droppath in config before build
@@ -860,22 +918,29 @@ class DepthBackend:
                 except Exception:
                     raise
 
-        # 5) Inference
+        # 5) Inference: prefer public API (infer_pil / infer) per README
         img = Image.open(image_path).convert('RGB')
         arr = np.asarray(img).astype('float32') / 255.0
         H, W = arr.shape[:2]
         x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
         try:
             with torch.inference_mode():
-                out = model(x)
-                if isinstance(out, (list, tuple)):
-                    depth = out[0]
-                elif isinstance(out, dict):
-                    depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                if hasattr(model, 'infer_pil'):
+                    depth_np = model.infer_pil(img)
+                elif hasattr(model, 'infer'):
+                    from zoedepth.utils.misc import pil_to_batched_tensor  # type: ignore
+                    X = pil_to_batched_tensor(img).to(device)
+                    depth_t = model.infer(X)
+                    depth_np = depth_t.squeeze().detach().cpu().float().numpy()
                 else:
-                    depth = out
-                depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
-                depth = depth.squeeze().detach().cpu().float().numpy()
+                    out = model(x)
+                    if isinstance(out, (list, tuple)):
+                        depth = out[0]
+                    elif isinstance(out, dict):
+                        depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                    else:
+                        depth = out
+                    depth_np = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False).squeeze().detach().cpu().float().numpy()
         except Exception as e:
             log = logging.getLogger("neurose_vton.person.depth")
             log.warning("ZoeDepth forward failed: %s", e)
@@ -892,19 +957,26 @@ class DepthBackend:
                             except Exception:
                                 pass
                 with torch.inference_mode():
-                    out = model(x)
-                    if isinstance(out, (list, tuple)):
-                        depth = out[0]
-                    elif isinstance(out, dict):
-                        depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                    if hasattr(model, 'infer_pil'):
+                        depth_np = model.infer_pil(img)
+                    elif hasattr(model, 'infer'):
+                        from zoedepth.utils.misc import pil_to_batched_tensor  # type: ignore
+                        X = pil_to_batched_tensor(img).to(device)
+                        depth_t = model.infer(X)
+                        depth_np = depth_t.squeeze().detach().cpu().float().numpy()
                     else:
-                        depth = out
-                    depth = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False)
-                    depth = depth.squeeze().detach().cpu().float().numpy()
+                        out = model(x)
+                        if isinstance(out, (list, tuple)):
+                            depth = out[0]
+                        elif isinstance(out, dict):
+                            depth = out.get('metric_depth') or out.get('depth') or next(iter(out.values()))
+                        else:
+                            depth = out
+                        depth_np = torch.nn.functional.interpolate(depth, size=(H, W), mode='bicubic', align_corners=False).squeeze().detach().cpu().float().numpy()
             except Exception:
                 raise
         # 6) Normalize and normals
-        p = depth
+        p = depth_np
         pmin, pmax = float(p.min()), float(p.max())
         p = (p - pmin) / (pmax - pmin + 1e-8)
         depth_u8 = (p * 255.0).astype(np.uint8)
