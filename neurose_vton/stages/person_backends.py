@@ -458,10 +458,27 @@ class ParsingBackend:
             arr = (arr - mean) / std
             chw = arr.transpose(2, 0, 1)  # CHW (BGR)
             x_t = torch.from_numpy(chw).unsqueeze(0).to(_SchpInlineModel.device())
-            if use_fp16:
-                x_t = x_t.half()
+            # Match input dtype to current model dtype to avoid mismatch errors
+            try:
+                param_dtype = next(model.parameters()).dtype  # type: ignore[attr-defined]
+            except Exception:
+                import torch as _t
+                param_dtype = _t.float32
+            x_t = x_t.to(param_dtype)
+            # Safe forward with dtype fallback
             with torch.no_grad():
-                o = model(x_t)
+                try:
+                    o = model(x_t)
+                except RuntimeError as e:
+                    # Fallback: try FP32 path if dtype mismatch surfaces
+                    if "Half" in str(e) or "float16" in str(e):
+                        try:
+                            model.float()
+                            o = model(x_t.float())
+                        except Exception:
+                            raise
+                    else:
+                        raise
             # Extract logits tensor robustly, matching simple_extractor: output[0][-1][0]
             logit_t = None
             if isinstance(o, (list, tuple)) and len(o) > 0:
