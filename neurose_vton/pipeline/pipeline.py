@@ -53,8 +53,8 @@ class TryOnPipeline:
 
         # Stage 1: Person analysis
         person = PersonAnalysis().run(person_image, seed, trace_dir=trace_dir)
-        # Stage 2: Garment analysis
-        garment = GarmentAnalysis().run(garment_image, seed)
+        # Stage 2: Garment analysis (isolated trace folder)
+        garment = GarmentAnalysis().run(garment_image, seed, trace_dir=trace_dir)
         # Stage 3: Composition planning
         plan = CompositionPlanning().run(person, garment, self.cfg.fit)
         # Stage 4: Diffusion core

@@ -9,7 +9,12 @@ class GarmentAnalysis:
     def __init__(self) -> None:
         pass
 
-    def run(self, garment_path: Path, seed: int) -> StageOutput:
+    def run(self, garment_path: Path, seed: int, trace_dir: Path | None = None) -> StageOutput:
+        # Reserve a stage-specific trace folder without writing placeholders
+        out_dir = None
+        if trace_dir is not None:
+            out_dir = trace_dir / "garment"
+            out_dir.mkdir(parents=True, exist_ok=True)
         resolved = {
             "sam2": str(registry.resolve("sam2") or ""),
             "matting_refine": str(registry.resolve("matting_refine") or ""),
