@@ -23,6 +23,16 @@ app = FastAPI(title="NEUROSE VTON Premium (Scaffold)")
 def on_startup() -> None:
     configure_logging(SETTINGS.log_level)
     enable_determinism(strict=SETTINGS.strict_determinism)
+    # Ensure expected runtime folders exist for third-party tools
+    try:
+        PATHS.runtime_cache.mkdir(parents=True, exist_ok=True)
+        PATHS.outputs.mkdir(parents=True, exist_ok=True)
+        for key in ("YOLO_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
+            p = os.environ.get(key)
+            if p:
+                Path(p).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 # Static mount for outputs to preview intermediates
 app.mount("/files", StaticFiles(directory=str(PATHS.outputs)), name="files")
@@ -116,6 +126,27 @@ def ui() -> HTMLResponse:
           </div>
           <div class=\"col\">
             <label><input type=\"checkbox\" name=\"return_intermediates\" checked /> save intermediates</label>
+          </div>
+        </div>
+        <div class=\"row\">
+          <div class=\"col\">
+            <label>Depth provider</label>
+            <select name=\"depth_provider\">
+              <option value=\"\">auto (env)</option>
+              <option value=\"midas\">MiDaS</option>
+              <option value=\"zoe\">ZoeDepth</option>
+            </select>
+          </div>
+          <div class=\"col\">
+            <label>MiDaS variant</label>
+            <input type=\"text\" name=\"midas_variant\" placeholder=\"DPT_BEiT_L_384\" />
+          </div>
+          <div class=\"col\">
+            <label>SCHP TTA scales</label>
+            <input type=\"text\" name=\"schp_tta_scales\" placeholder=\"1.0,0.75,1.25\" />
+          </div>
+          <div class=\"col\">
+            <label><input type=\"checkbox\" name=\"schp_fp16\" /> SCHP fp16</label>
           </div>
         </div>
         <button type=\"submit\">Run Try-On</button>
@@ -214,13 +245,41 @@ async def tryon_fast(
     garment_image: UploadFile = File(...),
     seed: Optional[int] = Form(None),
     return_intermediates: bool = Form(False),
+    depth_provider: Optional[str] = Form(None),  # 'midas' | 'zoe'
+    midas_variant: Optional[str] = Form(None),   # e.g., 'DPT_BEiT_L_384'
+    schp_tta_scales: Optional[str] = Form(None), # e.g., '1.0,0.75,1.25'
+    schp_fp16: Optional[int] = Form(None),       # 0/1
 ) -> JSONResponse:
     tmp = PATHS.runtime_cache / "uploads"
     p_path = _persist_upload(tmp, person_image)
     g_path = _persist_upload(tmp, garment_image)
 
-    cfg = TryOnConfig(steps=24, seed=seed, save_intermediates=return_intermediates)
-    result = TryOnPipeline(cfg).run(p_path, g_path)
+    # Per-request env overrides
+    overrides: dict[str, str] = {}
+    if depth_provider:
+        if depth_provider.lower() == 'midas':
+            overrides['NEUROSE_SKIP_ZOEDEPTH'] = '1'
+        elif depth_provider.lower() == 'zoe':
+            overrides['NEUROSE_SKIP_ZOEDEPTH'] = '0'
+    if midas_variant:
+        overrides['NEUROSE_MIDAS_VARIANT'] = midas_variant
+    if schp_tta_scales:
+        overrides['NEUROSE_SCHP_TTA_SCALES'] = schp_tta_scales
+    if schp_fp16 is not None:
+        overrides['NEUROSE_SCHP_FP16'] = '1' if int(schp_fp16) != 0 else '0'
+
+    prev: dict[str, Optional[str]] = {k: os.environ.get(k) for k in overrides}
+    try:
+        for k, v in overrides.items():
+            os.environ[k] = v
+        cfg = TryOnConfig(steps=24, seed=seed, save_intermediates=return_intermediates)
+        result = TryOnPipeline(cfg).run(p_path, g_path)
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
     return JSONResponse({
         "mode": "fast",
         "seed": seed or SETTINGS.seed,
@@ -236,13 +295,40 @@ async def tryon_premium(
     garment_image: UploadFile = File(...),
     seed: Optional[int] = Form(None),
     return_intermediates: bool = Form(False),
+    depth_provider: Optional[str] = Form(None),
+    midas_variant: Optional[str] = Form(None),
+    schp_tta_scales: Optional[str] = Form(None),
+    schp_fp16: Optional[int] = Form(None),
 ) -> JSONResponse:
     tmp = PATHS.runtime_cache / "uploads"
     p_path = _persist_upload(tmp, person_image)
     g_path = _persist_upload(tmp, garment_image)
 
-    cfg = TryOnConfig(steps=40, seed=seed, save_intermediates=return_intermediates)
-    result = TryOnPipeline(cfg).run(p_path, g_path)
+    overrides: dict[str, str] = {}
+    if depth_provider:
+        if depth_provider.lower() == 'midas':
+            overrides['NEUROSE_SKIP_ZOEDEPTH'] = '1'
+        elif depth_provider.lower() == 'zoe':
+            overrides['NEUROSE_SKIP_ZOEDEPTH'] = '0'
+    if midas_variant:
+        overrides['NEUROSE_MIDAS_VARIANT'] = midas_variant
+    if schp_tta_scales:
+        overrides['NEUROSE_SCHP_TTA_SCALES'] = schp_tta_scales
+    if schp_fp16 is not None:
+        overrides['NEUROSE_SCHP_FP16'] = '1' if int(schp_fp16) != 0 else '0'
+
+    prev: dict[str, Optional[str]] = {k: os.environ.get(k) for k in overrides}
+    try:
+        for k, v in overrides.items():
+            os.environ[k] = v
+        cfg = TryOnConfig(steps=40, seed=seed, save_intermediates=return_intermediates)
+        result = TryOnPipeline(cfg).run(p_path, g_path)
+    finally:
+        for k, old in prev.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
     return JSONResponse({
         "mode": "premium",
         "seed": seed or SETTINGS.seed,

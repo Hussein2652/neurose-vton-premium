@@ -27,6 +27,13 @@ def enable_determinism(strict: bool = True) -> dict[str, str]:
     env_changes: dict[str, str] = {}
     try:
         import torch  # type: ignore
+        import warnings
+
+        # Silence noisy third-party warnings we can't act on from dependencies
+        warnings.filterwarnings("ignore", message=r".*torch\.meshgrid.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=r".*enable_nested_tensor is True.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=r".*Mapping deprecated model name.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=r".*`rcond` parameter will change.*", category=UserWarning)
 
         if strict and hasattr(torch, "use_deterministic_algorithms"):
             torch.use_deterministic_algorithms(True, warn_only=not strict)

@@ -420,111 +420,100 @@ class ParsingBackend:
             bw = bh * aspect_ratio
         scale = np.array([bw, bh], dtype=np.float32)
         center = np.array([cx, cy], dtype=np.float32)
-        # Affine warp to network input size
+        # Multi-scale + flip TTA, accumulate in original resolution
         sys.path.insert(0, str(repo))
         from utils.transforms import get_affine_transform, transform_logits  # type: ignore
-        trans = get_affine_transform(center, scale, 0, input_size)
-        inp = cv2.warpAffine(
-            img_bgr,
-            trans,
-            (int(input_size[1]), int(input_size[0])),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
-        )
-        # To tensor (BGR order) and normalize with SCHP BGR means/stds
         import torch  # type: ignore
-        arr = inp.astype(np.float32) / 255.0
-        mean = np.array([0.406, 0.456, 0.485], dtype=np.float32)
-        std = np.array([0.225, 0.224, 0.229], dtype=np.float32)
-        arr = (arr - mean) / std
-        chw = arr.transpose(2, 0, 1)  # CHW
-        x_t = torch.from_numpy(chw).unsqueeze(0).to(_SchpInlineModel.device())
         use_fp16 = _SchpInlineModel.use_fp16() and str(_SchpInlineModel.device()) != 'cpu'
-        if use_fp16:
-            x_t = x_t.half()
+        # Parse scales from env
+        scales_env = os.environ.get("NEUROSE_SCHP_TTA_SCALES", "1.0")
+        try:
+            scale_factors = [float(s.strip()) for s in scales_env.split(',') if s.strip()]
+            if not scale_factors:
+                scale_factors = [1.0]
+        except Exception:
+            scale_factors = [1.0]
+        do_flip = os.environ.get("NEUROSE_SCHP_TTA_FLIP", "1") in {"1", "true", "True"}
 
-        with torch.no_grad():
-            try:
-                out = model(x_t)
-            except RuntimeError as e:
-                # Common on older SCHP when some ops/layers don't support fp16
-                if ("Half" in str(e) or "float16" in str(e)) and use_fp16:
-                    log.warning("SCHP inline fp16 failed; retrying fp32")
-                    try:
-                        model.float()
-                    except Exception:
-                        pass
-                    out = model(x_t.float())
-                else:
-                    raise
+        num_classes = 20
+        logits_sum = None  # numpy (H, W, C)
+        count = 0
+
+        def forward_logits_for(center_np, scale_np, flip: bool) -> Optional[np.ndarray]:
+            # Affine warp to network input size at this scale
+            trans = get_affine_transform(center_np, scale_np, 0, input_size)
+            inp = cv2.warpAffine(
+                img_bgr,
+                trans,
+                (int(input_size[1]), int(input_size[0])),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+            if flip:
+                inp = cv2.flip(inp, 1)
+            arr = inp.astype(np.float32) / 255.0
+            mean = np.array([0.406, 0.456, 0.485], dtype=np.float32)
+            std = np.array([0.225, 0.224, 0.229], dtype=np.float32)
+            arr = (arr - mean) / std
+            chw = arr.transpose(2, 0, 1)  # CHW (BGR)
+            x_t = torch.from_numpy(chw).unsqueeze(0).to(_SchpInlineModel.device())
+            if use_fp16:
+                x_t = x_t.half()
+            with torch.no_grad():
+                o = model(x_t)
             # Extract logits tensor robustly, matching simple_extractor: output[0][-1][0]
-            logits = None
-            try:
-                if isinstance(out, (list, tuple)) and len(out) > 0:
-                    o0 = out[0]
-                    if isinstance(o0, (list, tuple)) and len(o0) > 0:
-                        last = o0[-1]
-                        if isinstance(last, (list, tuple)) and len(last) > 0:
-                            logits = last[0]
-                        else:
-                            logits = last
-                    else:
-                        logits = o0
-                elif isinstance(out, dict):
-                    logits = out.get('out') or out.get('logits') or out.get('result') or next(iter(out.values()))
+            logit_t = None
+            if isinstance(o, (list, tuple)) and len(o) > 0:
+                o0 = o[0]
+                if isinstance(o0, (list, tuple)) and len(o0) > 0:
+                    last = o0[-1]
+                    logit_t = last[0] if isinstance(last, (list, tuple)) and len(last) > 0 else last
                 else:
-                    logits = out
-                if isinstance(logits, (list, tuple)) and len(logits) > 0:
-                    logits = logits[0]
-            except Exception:
-                logits = None
-            # logits shape: [B, C, H, W]
-            if not (isinstance(logits, torch.Tensor) and logits.dim() == 4):
+                    logit_t = o0
+            elif isinstance(o, dict):
+                logit_t = o.get('out') or o.get('logits') or o.get('result') or next(iter(o.values()))
+            else:
+                logit_t = o
+            if isinstance(logit_t, (list, tuple)) and len(logit_t) > 0:
+                logit_t = logit_t[0]
+            if not (isinstance(logit_t, torch.Tensor) and logit_t.dim() == 4):
                 return None
-            # Normalize to fixed input size
-            logits = torch.nn.functional.interpolate(logits.float(), size=tuple(input_size.tolist()), mode='bilinear', align_corners=True)
-            logits_acc = logits
-            # Optional TTA: horizontal flip
-            try:
-                if os.environ.get("NEUROSE_SCHP_TTA_FLIP", "1") in {"1", "true", "True"}:
-                    x_flip = torch.flip(x_t, dims=[3])
-                    out_f = model(x_flip if not use_fp16 else x_flip.half())
-                    # get logits like above
-                    lf = None
-                    if isinstance(out_f, (list, tuple)) and len(out_f) > 0:
-                        o0 = out_f[0]
-                        if isinstance(o0, (list, tuple)) and len(o0) > 0:
-                            last = o0[-1]
-                            lf = last[0] if isinstance(last, (list, tuple)) and len(last) > 0 else last
-                        else:
-                            lf = o0
-                    elif isinstance(out_f, dict):
-                        lf = out_f.get('out') or out_f.get('logits') or out_f.get('result') or next(iter(out_f.values()))
-                    else:
-                        lf = out_f
-                    if isinstance(lf, (list, tuple)) and len(lf) > 0:
-                        lf = lf[0]
-                    if isinstance(lf, torch.Tensor) and lf.dim() == 4:
-                        lf = torch.nn.functional.interpolate(lf.float(), size=tuple(input_size.tolist()), mode='bilinear', align_corners=True)
-                        # Unflip logits spatially
-                        lf = torch.flip(lf, dims=[3])
-                        # Swap left/right channels for LIP indices
-                        # Indices: 14<->15 (arms), 16<->17 (legs), 18<->19 (shoes)
-                        idx = list(range(20))
-                        idx[14], idx[15] = idx[15], idx[14]
-                        idx[16], idx[17] = idx[17], idx[16]
-                        idx[18], idx[19] = idx[19], idx[18]
-                        import torch as _t
-                        idx_t = _t.tensor(idx, dtype=_t.long, device=lf.device)
-                        lf = lf[:, idx_t, :, :]
-                        logits_acc = (logits_acc + lf) * 0.5
-            except Exception:
-                pass
-            logits_hw = logits_acc[0].permute(1, 2, 0).cpu().numpy()  # HWC
-        # Map back to original resolution using SCHP transform
-        logits_resized = transform_logits(logits_hw, center, scale, w, h, input_size=input_size.tolist())
-        parsing = np.argmax(logits_resized, axis=2).astype(np.uint8)
+            logit_t = torch.nn.functional.interpolate(logit_t.float(), size=tuple(input_size.tolist()), mode='bilinear', align_corners=True)
+            if flip:
+                # Unflip logits spatially and swap L/R class channels
+                logit_t = torch.flip(logit_t, dims=[3])
+                idx = list(range(num_classes))
+                # Swap 14<->15 (arms), 16<->17 (legs), 18<->19 (shoes)
+                if num_classes >= 20:
+                    idx[14], idx[15] = idx[15], idx[14]
+                    idx[16], idx[17] = idx[17], idx[16]
+                    idx[18], idx[19] = idx[19], idx[18]
+                import torch as _t
+                idx_t = _t.tensor(idx, dtype=_t.long, device=logit_t.device)
+                logit_t = logit_t[:, idx_t, :, :]
+            logits_hw = logit_t[0].permute(1, 2, 0).cpu().numpy()  # HWC
+            # Map back to original resolution for this scale
+            logits_res = transform_logits(logits_hw, center_np, scale_np, w, h, input_size=input_size.tolist())
+            return logits_res.astype(np.float32, copy=False)
+
+        for sf in scale_factors:
+            scale_f = scale * float(sf)
+            # base
+            lr = forward_logits_for(center, scale_f, flip=False)
+            if lr is not None:
+                logits_sum = (lr if logits_sum is None else logits_sum + lr)
+                count += 1
+            # flip
+            if do_flip:
+                lr_f = forward_logits_for(center, scale_f, flip=True)
+                if lr_f is not None:
+                    logits_sum = (lr_f if logits_sum is None else logits_sum + lr_f)
+                    count += 1
+        if logits_sum is None or count == 0:
+            return None
+        logits_avg = logits_sum / float(count)
+        parsing = np.argmax(logits_avg, axis=2).astype(np.uint8)
         # Save next to trace output (handled by caller) with color palette like SCHP
         from tempfile import mkdtemp
         tmpd = Path(mkdtemp())
@@ -637,7 +626,13 @@ class DepthBackend:
             except Exception:
                 pass
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            midas = torch.hub.load('intel-isl/MiDaS', 'DPT_Hybrid')
+            # Allow variant selection via env, default to highest quality
+            variant = os.environ.get("NEUROSE_MIDAS_VARIANT", "DPT_BEiT_L_384").strip()
+            try:
+                midas = torch.hub.load('intel-isl/MiDaS', variant)
+            except Exception:
+                # Fallback to DPT_Hybrid if selected variant missing
+                midas = torch.hub.load('intel-isl/MiDaS', 'DPT_Hybrid')
             midas.to(device).eval()
             img = Image.open(image_path).convert('RGB')
             W, H = img.size
@@ -867,7 +862,17 @@ class DepthBackend:
             model = build_model(conf).to(device).eval()
         except Exception as e:
             logging.getLogger("neurose_vton.person.depth").warning("ZoeDepth build failed: %s", e)
-            raise
+            # Retry build without auto-loading weights; we'll load state manually
+            try:
+                if hasattr(conf, "pretrained_resource"):
+                    setattr(conf, "pretrained_resource", None)
+                if hasattr(conf, "zoedepth") and isinstance(conf.zoedepth, dict):
+                    conf.zoedepth["pretrained_resource"] = None
+                if hasattr(conf, "zoedepth_nk") and isinstance(conf.zoedepth_nk, dict):
+                    conf.zoedepth_nk["pretrained_resource"] = None
+            except Exception:
+                pass
+            model = build_model(conf).to(device).eval()
         # Disable droppath modules/attrs post-build
         _replace_droppath_modules(model)
         # 4) Load checkpoint
