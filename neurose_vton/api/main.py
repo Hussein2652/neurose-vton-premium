@@ -182,6 +182,18 @@ def ui() -> HTMLResponse:
             }
             html += '</div>';
             html += '<div class=\"muted\">Trace folder: <code>'+traceUrl+'</code></div>';
+            // Garment block
+            const g = traceUrl + '/garment';
+            html += '<hr /><div><b>Garment</b>:</div>';
+            html += '<div class=\"row\">';
+            const gimgs = [
+              'garment_matte.png','garment_matte_refined.png','uv_atlas.png','print_mask.png'
+            ];
+            for (const name of gimgs) {
+              html += '<div class=\"col\"><div class=\"muted\">'+name+'</div><img src=\"'+g+'/'+name+'\" onerror=\"this.style.display=\\'none\\'\" /></div>';
+            }
+            html += '</div>';
+            html += '<div class=\"muted\">Garment models/status: <a href=\"'+g+'/models.json\" target=\"_blank\">models.json</a> · <a href=\"'+g+'/status.json\" target=\"_blank\">status.json</a></div>';
           }
           out.innerHTML = html;
         } catch (err) {
