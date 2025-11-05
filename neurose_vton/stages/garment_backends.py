@@ -19,17 +19,61 @@ class Sam2MatteBackend:
         repo = os.environ.get("NEUROSE_REPO_SAM2")
         if repo and Path(repo).exists():
             sys.path.insert(0, repo)
+            sys.path.insert(0, str(Path(repo) / "sam2"))
             try:
                 import torch  # type: ignore
                 import numpy as np  # type: ignore
                 from PIL import Image
-                # Common SAM2 predictor API attempt; adapt as needed to your repo
-                try:
-                    from sam2.sam2_image_predictor import SAM2ImagePredictor  # type: ignore
-                    from sam2.build_sam2 import build_sam2  # type: ignore
-                except Exception:
-                    from sam2.build_sam import build_sam2  # type: ignore
-                    from sam2.sam2_image_predictor import SAM2ImagePredictor  # type: ignore
+                # Try common SAM2 predictor/build import paths
+                SAM2ImagePredictor = None  # type: ignore
+                build_sam2 = None  # type: ignore
+                imp_errors = []
+                for mod_pred, mod_build in [
+                    ("sam2.sam2_image_predictor", "sam2.build_sam2"),
+                    ("sam2.sam2.sam2_image_predictor", "sam2.sam2.build_sam2"),
+                ]:
+                    try:
+                        _pred = __import__(mod_pred, fromlist=["SAM2ImagePredictor"])  # type: ignore
+                        _build = __import__(mod_build, fromlist=["build_sam2"])  # type: ignore
+                        SAM2ImagePredictor = getattr(_pred, "SAM2ImagePredictor")  # type: ignore
+                        build_sam2 = getattr(_build, "build_sam2")  # type: ignore
+                        break
+                    except Exception as _e:
+                        imp_errors.append(str(_e))
+                        continue
+                # Dynamic fallback: locate predictor and builder files
+                if SAM2ImagePredictor is None or build_sam2 is None:
+                    import importlib.util
+                    repo_path = Path(repo)
+                    # predictor
+                    pred_file = None
+                    for cand in repo_path.rglob("sam2_image_predictor.py"):
+                        pred_file = cand
+                        break
+                    if pred_file is not None:
+                        spec = importlib.util.spec_from_file_location("_sam2_pred_mod", str(pred_file))
+                        if spec and spec.loader:
+                            pred_mod = importlib.util.module_from_spec(spec)
+                            sys.modules["_sam2_pred_mod"] = pred_mod
+                            spec.loader.exec_module(pred_mod)  # type: ignore
+                            SAM2ImagePredictor = getattr(pred_mod, "SAM2ImagePredictor", None)
+                    # builder
+                    build_file = None
+                    for name in ("build_sam2.py", "build_sam.py"):
+                        for cand in repo_path.rglob(name):
+                            build_file = cand
+                            break
+                        if build_file:
+                            break
+                    if build_file is not None:
+                        specb = importlib.util.spec_from_file_location("_sam2_build_mod", str(build_file))
+                        if specb and specb.loader:
+                            bmod = importlib.util.module_from_spec(specb)
+                            sys.modules["_sam2_build_mod"] = bmod
+                            specb.loader.exec_module(bmod)  # type: ignore
+                            build_sam2 = getattr(bmod, "build_sam2", None) or getattr(bmod, "build_sam", None)
+                if SAM2ImagePredictor is None or build_sam2 is None:
+                    raise ImportError("SAM2 imports failed: " + "; ".join(imp_errors))
                 # Locate weight
                 weight = None
                 if self.model_dir and self.model_dir.exists():
@@ -43,7 +87,80 @@ class Sam2MatteBackend:
                     log.warning("SAM2 weight not found in %s", str(self.model_dir) if self.model_dir else "<unset>")
                 else:
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    model = build_sam2(checkpoint=str(weight))  # type: ignore
+                    # Locate a config YAML; prefer one that matches 'hiera' and 'large'
+                    repo_path = Path(repo)
+                    cfg = None
+                    preferred = []
+                    for cand in repo_path.rglob("*.yaml"):
+                        name = cand.name.lower()
+                        if "sam2" in str(cand.parent).lower() or "config" in str(cand.parent).lower():
+                            preferred.append(cand)
+                    # rank by keywords
+                    def rank(p: Path) -> int:
+                        n = p.name.lower()
+                        score = 0
+                        if "hiera" in n:
+                            score += 2
+                        if "large" in n or n.endswith("_l.yaml") or "_l_" in n:
+                            score += 2
+                        if "sam2" in n:
+                            score += 1
+                        return score
+                    if preferred:
+                        preferred.sort(key=rank, reverse=True)
+                        cfg = preferred[0]
+                    else:
+                        # fallback: any yaml in repo
+                        any_yaml = list(repo_path.rglob("*.yaml"))
+                        if any_yaml:
+                            cfg = any_yaml[0]
+                    if cfg is None:
+                        raise FileNotFoundError("SAM2 config .yaml not found in repo")
+                    # Build model with flexible signature + Hydra support
+                    built = False
+                    import inspect
+                    params = list(inspect.signature(build_sam2).parameters.keys())  # type: ignore
+                    cfg_name = cfg.stem
+                    # 1) Try by parameter names
+                    try:
+                        kwargs = {}
+                        if 'config_name' in params:
+                            kwargs['config_name'] = cfg_name
+                        elif 'config_file' in params:
+                            kwargs['config_file'] = str(cfg)
+                        elif 'config' in params:
+                            kwargs['config'] = str(cfg)
+                        if 'checkpoint' in params:
+                            kwargs['checkpoint'] = str(weight)
+                        model = build_sam2(**kwargs)  # type: ignore
+                        built = True
+                    except Exception:
+                        pass
+                    # 2) Try positional fallbacks
+                    if not built:
+                        try:
+                            model = build_sam2(str(cfg), str(weight))  # type: ignore
+                            built = True
+                        except Exception:
+                            pass
+                    # 3) Hydra initialize in cfg directory and try name
+                    if not built:
+                        try:
+                            from hydra import initialize_config_dir  # type: ignore
+                            with initialize_config_dir(version_base=None, config_dir=str(cfg.parent), job_name="sam2_build"):
+                                try:
+                                    model = build_sam2(config_name=cfg.name, checkpoint=str(weight))  # type: ignore
+                                    built = True
+                                except Exception:
+                                    try:
+                                        model = build_sam2(config_name=cfg.stem, checkpoint=str(weight))  # type: ignore
+                                        built = True
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    if not built:
+                        raise RuntimeError(f"SAM2 build failed for cfg={cfg}")
                     predictor = SAM2ImagePredictor(model)  # type: ignore
                     predictor.to(device)
                     image = Image.open(garment_path).convert("RGB")
@@ -112,9 +229,12 @@ class MattingRefineBackend:
             sys.path.insert(0, repo)
             try:
                 import torch  # type: ignore
-                # Example expected API; adjust to your repo
-                from rvm.model import MattingNetwork  # type: ignore
                 import cv2  # type: ignore
+                # Try common RVM import paths
+                try:
+                    from model import MattingNetwork  # type: ignore
+                except Exception:
+                    from rvm.model import MattingNetwork  # type: ignore
                 net = MattingNetwork("mobilenetv3").eval()  # type: ignore
                 weight = None
                 for pat in ("*.pt", "*.pth"):
