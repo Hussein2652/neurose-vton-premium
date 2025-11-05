@@ -193,7 +193,7 @@ def ui() -> HTMLResponse:
               html += '<div class=\"col\"><div class=\"muted\">'+name+'</div><img src=\"'+g+'/'+name+'\" onerror=\"this.style.display=\\'none\\'\" /></div>';
             }
             html += '</div>';
-            html += '<div class=\"muted\">Garment models/status: <a href=\"'+g+'/models.json\" target=\"_blank\">models.json</a> · <a href=\"'+g+'/status.json\" target=\"_blank\">status.json</a></div>';
+            html += '<div class=\"muted\">Garment models/status: <a href=\"'+g+'/models.json\" target=\"_blank\">models.json</a> · <a href=\"'+g+'/status.json\" target=\"_blank\">status.json</a> · <a href=\"'+g+'/attributes.json\" target=\"_blank\">attributes.json</a></div>';
           }
           out.innerHTML = html;
         } catch (err) {
