@@ -143,20 +143,32 @@ class Sam2MatteBackend:
                             built = True
                         except Exception:
                             pass
-                    # 3) Hydra initialize in cfg directory and try name
+                    # 3) Hydra initialize with package module (common in SAM2 repos)
                     if not built:
                         try:
-                            from hydra import initialize_config_dir  # type: ignore
-                            with initialize_config_dir(version_base=None, config_dir=str(cfg.parent), job_name="sam2_build"):
+                            from hydra import initialize_config_module  # type: ignore
+                            candidates = [cfg.stem]
+                            # Common SAM2 config names to try as fallbacks
+                            candidates += [
+                                "sam2_hiera_l",
+                                "sam2_hiera_b",
+                                "sam2_hiera_t",
+                                "sam2_hiera_s",
+                            ]
+                            for mod in ("sam2", "sam2.sam2"):
                                 try:
-                                    model = build_sam2(config_name=cfg.name, checkpoint=str(weight))  # type: ignore
-                                    built = True
+                                    with initialize_config_module(version_base=None, config_module=mod):
+                                        for name in candidates:
+                                            try:
+                                                model = build_sam2(config_name=name, checkpoint=str(weight))  # type: ignore
+                                                built = True
+                                                break
+                                            except Exception:
+                                                continue
                                 except Exception:
-                                    try:
-                                        model = build_sam2(config_name=cfg.stem, checkpoint=str(weight))  # type: ignore
-                                        built = True
-                                    except Exception:
-                                        pass
+                                    continue
+                                if built:
+                                    break
                         except Exception:
                             pass
                     if not built:
