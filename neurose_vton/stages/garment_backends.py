@@ -74,9 +74,12 @@ class Sam2MatteBackend:
                             build_sam2 = getattr(bmod, "build_sam2", None) or getattr(bmod, "build_sam", None)
                 if SAM2ImagePredictor is None or build_sam2 is None:
                     raise ImportError("SAM2 imports failed: " + "; ".join(imp_errors))
-                # Locate weight
+                # Locate weight: prefer explicit env file then scan dir
                 weight = None
-                if self.model_dir and self.model_dir.exists():
+                env_w = os.environ.get("NEUROSE_MODEL_SAM2")
+                if env_w and Path(env_w).exists():
+                    weight = Path(env_w)
+                elif self.model_dir and self.model_dir.exists():
                     for pat in ("*.pt", "*.pth"):
                         for cand in self.model_dir.glob(pat):
                             weight = cand
@@ -89,6 +92,9 @@ class Sam2MatteBackend:
                     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                     # Locate a config YAML; prefer one that matches 'hiera' and 'large'
                     repo_path = Path(repo)
+                    # Allow explicit ENV overrides for config
+                    cfg_name_env = os.environ.get("NEUROSE_SAM2_CONFIG_NAME")
+                    cfg_mod_env = os.environ.get("NEUROSE_SAM2_CONFIG_MODULE")
                     cfg = None
                     preferred = []
                     for cand in repo_path.rglob("*.yaml"):
@@ -120,7 +126,7 @@ class Sam2MatteBackend:
                     built = False
                     import inspect
                     params = list(inspect.signature(build_sam2).parameters.keys())  # type: ignore
-                    cfg_name = cfg.stem
+                    cfg_name = cfg_name_env or cfg.stem
                     # 1) Try by parameter names
                     try:
                         kwargs = {}
@@ -147,7 +153,7 @@ class Sam2MatteBackend:
                     if not built:
                         try:
                             from hydra import initialize_config_module  # type: ignore
-                            candidates = [cfg.stem]
+                            candidates = [cfg_name]
                             # Common SAM2 config names to try as fallbacks
                             candidates += [
                                 "sam2_hiera_l",
@@ -155,7 +161,8 @@ class Sam2MatteBackend:
                                 "sam2_hiera_t",
                                 "sam2_hiera_s",
                             ]
-                            for mod in ("sam2", "sam2.sam2"):
+                            modules = [m for m in [cfg_mod_env, "sam2.sam2", "sam2"] if m]
+                            for mod in modules:
                                 try:
                                     with initialize_config_module(version_base=None, config_module=mod):
                                         for name in candidates:
